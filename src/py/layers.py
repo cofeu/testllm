@@ -1,6 +1,7 @@
 """Transformer katmanlari: her biri kendi forward + backward (gradyan) hesabini yapar."""
 
 import math
+import random
 
 from ops import (
     add_bias,
@@ -26,6 +27,60 @@ def gelu(x):
 
 def gelu_grad(x):
     return 0.5 * (1.0 + math.erf(x * _INV_SQRT2)) + x * _INV_SQRT2PI * math.exp(-0.5 * x * x)
+
+
+class Dropout:
+    def __init__(self, p=0.0, rng=None):
+        self.p = max(0.0, min(1.0, p))
+        self.rng = rng or random.Random()
+        self.mask = None
+
+    def forward(self, x):
+        if self.p <= 0.0:
+            return [row[:] for row in x]
+        out = []
+        self.mask = []
+        for row in x:
+            mrow = []
+            out_row = []
+            for v in row:
+                keep = self.rng.random() >= self.p
+                mrow.append(1.0 if keep else 0.0)
+                out_row.append(v * (1.0 if keep else 0.0) / max(1e-8, 1.0 - self.p))
+            self.mask.append(mrow)
+            out.append(out_row)
+        return out
+
+    def backward(self, dy):
+        if self.p <= 0.0 or self.mask is None:
+            return [row[:] for row in dy]
+        out = []
+        for row, mrow in zip(dy, self.mask):
+            out.append([v * m for v, m in zip(row, mrow)])
+        return out
+
+
+def apply_rope(x, use_rope=False):
+    if not use_rope:
+        return x
+    n = len(x)
+    d = len(x[0])
+    inv_freq = [1.0 / (10000 ** (2 * (k // 2) / d)) for k in range(0, d, 2)]
+    out = [list(r) for r in x]
+    for pos in range(n):
+        row = out[pos]
+        for j in range(0, d, 2):
+            if j + 1 >= d:
+                continue
+            k = j // 2
+            theta = pos * inv_freq[k]
+            c = math.cos(theta)
+            s = math.sin(theta)
+            x0 = row[j]
+            x1 = row[j + 1]
+            row[j] = x0 * c - x1 * s
+            row[j + 1] = x0 * s + x1 * c
+    return out
 
 
 class Linear:
@@ -122,23 +177,28 @@ class LayerNorm:
 
 
 class CausalSelfAttention:
-    def __init__(self, d_model, n_heads, rng, std=0.02):
+    def __init__(self, d_model, n_heads, rng, std=0.02, use_rope=False, dropout=0.0):
         assert d_model % n_heads == 0
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.use_rope = use_rope
+        self.dropout = Dropout(dropout, rng)
         self.q = Linear(d_model, d_model, rng, bias=False, std=std)
         self.k = Linear(d_model, d_model, rng, bias=False, std=std)
         self.v = Linear(d_model, d_model, rng, bias=False, std=std)
         self.o = Linear(d_model, d_model, rng, bias=False, std=std)
         self._heads = None
+        self.kv_cache = None
 
-    def forward(self, x):
+    def forward(self, x, cache=None, position_offset=0):
         n = len(x)
-        Q = self.q.forward(x)
-        K = self.k.forward(x)
+        Q = apply_rope(self.q.forward(x), self.use_rope)
+        K = apply_rope(self.k.forward(x), self.use_rope)
         V = self.v.forward(x)
+        if cache is not None:
+            self.kv_cache = {"k": K, "v": V}
         hd = self.head_dim
         heads = []
         concat = None
@@ -155,6 +215,8 @@ class CausalSelfAttention:
                 for j in range(i + 1):
                     row[j] *= self.scale
             P = softmax_rows(S)
+            if self.dropout.p > 0.0:
+                P = self.dropout.forward(P)
             O = matmul(P, Vh)
             heads.append((Qh, Kh, Vh, P))
             if concat is None:
@@ -177,6 +239,8 @@ class CausalSelfAttention:
             Qh, Kh, Vh, P = self._heads[h]
             dOh = split_cols(dconcat, a, b)
             dP = matmul_nt(dOh, Vh)
+            if self.dropout.p > 0.0:
+                dP = self.dropout.backward(dP)
             dVh = matmul_t(P, dOh)
             dS = zeros(n, n)
             for i in range(n):
@@ -212,19 +276,22 @@ class CausalSelfAttention:
 
 
 class MLP:
-    def __init__(self, d_model, hidden, rng, std=0.02):
+    def __init__(self, d_model, hidden, rng, std=0.02, dropout=0.0):
         self.fc = Linear(d_model, hidden, rng, std=std)
         self.proj = Linear(hidden, d_model, rng, std=std)
+        self.dropout = Dropout(dropout, rng)
         self._pre = None
 
     def forward(self, x):
         pre = self.fc.forward(x)
         self._pre = pre
         h = [[gelu(v) for v in row] for row in pre]
+        h = self.dropout.forward(h)
         return self.proj.forward(h)
 
     def backward(self, dout):
         dh = self.proj.backward(dout)
+        dh = self.dropout.backward(dh)
         pre = self._pre
         dpre = [
             [dh[i][j] * gelu_grad(pre[i][j]) for j in range(len(dh[i]))]
@@ -238,16 +305,19 @@ class MLP:
 
 
 class Block:
-    def __init__(self, d_model, n_heads, ffn_hidden, rng, resid_std=0.02):
+    def __init__(self, d_model, n_heads, ffn_hidden, rng, resid_std=0.02, dropout=0.0, use_rope=False):
         self.ln1 = LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, rng, std=resid_std)
+        self.attn = CausalSelfAttention(d_model, n_heads, rng, std=resid_std, use_rope=use_rope, dropout=dropout)
         self.ln2 = LayerNorm(d_model)
-        self.mlp = MLP(d_model, ffn_hidden, rng, std=resid_std)
+        self.mlp = MLP(d_model, ffn_hidden, rng, std=resid_std, dropout=dropout)
+        self.dropout = Dropout(dropout, rng)
 
-    def forward(self, x):
-        a = self.attn.forward(self.ln1.forward(x))
+    def forward(self, x, cache=None, position_offset=0):
+        a = self.attn.forward(self.ln1.forward(x), cache=cache, position_offset=position_offset)
+        a = self.dropout.forward(a)
         x1 = [[av + xv for av, xv in zip(arow, xrow)] for arow, xrow in zip(a, x)]
         b = self.mlp.forward(self.ln2.forward(x1))
+        b = self.dropout.forward(b)
         return [[bv + x1v for bv, x1v in zip(brow, x1row)] for brow, x1row in zip(b, x1)]
 
     def backward(self, dout):

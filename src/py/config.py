@@ -25,6 +25,9 @@ class Config:
     warmup: int = 50
     weight_decay: float = 0.01
     grad_clip: float = 1.0
+    dropout: float = 0.0
+    tie_weights: bool = False
+    use_rope: bool = False
 
     batch_size: int = 4
     max_steps: int = 300
