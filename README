@@ -1,0 +1,46 @@
+### TestLLM
+Bu proje pytorch ve ya diğer dependencyler olmadan llm çalıştırmayı hedefler
+
+Saf Python (standart kütüphane) ile sıfırdan yazılmış decoder-only transformer:
+matris çarpımı, softmax, layer norm, GELU, cross-entropy, backward (gradyan)
+hesapları, AdamW optimizasyonu ve örnekleme (temperature/top-k) — hepsi bu
+depodaki kod tarafından yapılıyor. `pip install` gerekmez.
+
+#### Dizin yapısı
+```
+data/data.jsonl      egitim verisi (Turkce, {turns: [[kullanici, asistan], ...]})
+src/py/
+  ops.py             matris/vektor matematigi (matmul, softmax, ...)
+  layers.py          Linear, Embedding, LayerNorm, attention, MLP + backward
+  model.py           transformer LM + cross-entropy gradyanlari
+  tokenizer.py       bayt seviyesi tokenizer (UTF-8, 260 token)
+  dataset.py         jsonl -> token akisi -> (girdi, hedef) pencereleri
+  optim.py           AdamW, gradyan kliplemesi, lr zamanlamasi
+  config.py          hiperparametreler
+  checkpoint.py      pickle ile agirlik kaydetme/yukleme
+  train.py           egitim dongusu
+  generate.py        metin uretimi / interaktif sohbet
+  test_grads.py      sonlu fark ile gradyan dogrulamasi
+checkpoints/         egitim sonrasi agirliklar (otomatik olusturulur)
+```
+
+#### Kullanim (proje kokunden)
+```
+python3 src/py/test_grads.py                 # backward'larin dorulugu (87 kontrol)
+python3 src/py/train.py                      # varsayilan ayarlarla egitim
+python3 src/py/train.py --steps 500 --batch 4 --d-model 64 --layers 3
+python3 src/py/train.py --resume             # kaldigi yerden devam
+python3 src/py/generate.py --prompt "K: Merhaba\nA:"
+python3 src/py/generate.py --interactive     # sohbet modu
+```
+
+#### Varsayilan model
+d_model=48, 2 katman, 2 kafa, ffn=192, blok=48, 83.520 parametre.
+Not: saf Python yavistir; varsayilan ayarlarla adim basina ~8-9 saniye
+(batch 2 ile ~4-5 sn) gerekir. Kucuk ayarlar (--d-model 32 --layers 1
+--block 32) ile denemeleri hizlandirabilirsiniz.
+
+#### Veri formati
+Her satir bir diyalog: `{"turns": [[soru, cevap], ...]}`. Model su bicimde
+ogrenir: `<bos> K: soru\nA: cevap <eos>` (bayt tokenizer, Turkce karakterler
+dogrudan kodlanir).
