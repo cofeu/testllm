@@ -75,12 +75,14 @@ def apply_args(cfg, args, arch=True):
 def evaluate(model, windows, cfg, max_items=32):
     if not windows:
         return float("nan")
+    model.eval()
     total = 0.0
     count = 0
     for x, y in windows[:max_items]:
         loss, _ = model.forward(x, y)
         total += loss
         count += 1
+    model.train()
     return total / max(1, count)
 
 
@@ -115,6 +117,7 @@ def main():
     )
 
     model = TransformerLM(cfg, random.Random(cfg.seed))
+    model.train()
     if ckpt is not None:
         model.load_state_dict(ckpt["state"])
 
@@ -177,6 +180,7 @@ def main():
                 save_checkpoint(
                     cfg.ckpt_path, model, cfg, step,
                     {"val_loss": vl, "opt_m": opt.m, "opt_v": opt.v},
+                    tokenizer=tok,
                 )
                 print(f"         checkpoint -> {cfg.ckpt_path}")
 
@@ -184,6 +188,7 @@ def main():
     save_checkpoint(
         cfg.ckpt_path, model, cfg, step,
         {"val_loss": vl, "opt_m": opt.m, "opt_v": opt.v},
+        tokenizer=tok,
     )
     print(f"tamamlandi: {step} adim, son val loss {vl:.4f}, ckpt {cfg.ckpt_path}")
 

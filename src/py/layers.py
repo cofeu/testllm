@@ -34,9 +34,10 @@ class Dropout:
         self.p = max(0.0, min(1.0, p))
         self.rng = rng or random.Random()
         self.mask = None
+        self.training = True
 
     def forward(self, x):
-        if self.p <= 0.0:
+        if not self.training or self.p <= 0.0:
             return [row[:] for row in x]
         out = []
         self.mask = []
@@ -52,7 +53,7 @@ class Dropout:
         return out
 
     def backward(self, dy):
-        if self.p <= 0.0 or self.mask is None:
+        if not self.training or self.p <= 0.0 or self.mask is None:
             return [row[:] for row in dy]
         out = []
         for row, mrow in zip(dy, self.mask):
@@ -60,7 +61,7 @@ class Dropout:
         return out
 
 
-def apply_rope(x, use_rope=False):
+def apply_rope(x, use_rope=False, inverse=False):
     if not use_rope:
         return x
     n = len(x)
@@ -78,8 +79,36 @@ def apply_rope(x, use_rope=False):
             s = math.sin(theta)
             x0 = row[j]
             x1 = row[j + 1]
-            row[j] = x0 * c - x1 * s
-            row[j + 1] = x0 * s + x1 * c
+            if inverse:
+                row[j] = x0 * c + x1 * s
+                row[j + 1] = -x0 * s + x1 * c
+            else:
+                row[j] = x0 * c - x1 * s
+                row[j + 1] = x0 * s + x1 * c
+    return out
+
+
+def apply_rope_backward(grad, use_rope=False):
+    """apply_rope'un ters (transpoze) rotasyonu: R^T g."""
+    if not use_rope:
+        return grad
+    n = len(grad)
+    d = len(grad[0])
+    inv_freq = [1.0 / (10000 ** (2 * (k // 2) / d)) for k in range(0, d, 2)]
+    out = [list(r) for r in grad]
+    for pos in range(n):
+        row = out[pos]
+        for j in range(0, d, 2):
+            if j + 1 >= d:
+                continue
+            k = j // 2
+            theta = pos * inv_freq[k]
+            c = math.cos(theta)
+            s = math.sin(theta)
+            g0 = row[j]
+            g1 = row[j + 1]
+            row[j] = g0 * c + g1 * s
+            row[j + 1] = -g0 * s + g1 * c
     return out
 
 
@@ -263,6 +292,9 @@ class CausalSelfAttention:
                     dQrow[a + j] += dQhrow[j] * self.scale
                     dKrow[a + j] += dKhrow[j] * self.scale
                     dVrow[a + j] += dVhrow[j]
+        if self.use_rope:
+            dQ = apply_rope(dQ, self.use_rope, inverse=True)
+            dK = apply_rope(dK, self.use_rope, inverse=True)
         dx = self.q.backward(dQ)
         add_into(dx, self.k.backward(dK))
         add_into(dx, self.v.backward(dV))

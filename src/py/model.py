@@ -33,6 +33,7 @@ class TransformerLM:
         rng = rng or random.Random(cfg.seed)
         d = cfg.d_model
         resid_std = 0.02 / math.sqrt(2 * cfg.n_layers)
+        self.training = True
         self.tie_weights = bool(getattr(cfg, "tie_weights", False))
         self.use_rope = bool(getattr(cfg, "use_rope", False))
         self.wte = Embedding(cfg.vocab_size, d, rng, std=0.02)
@@ -44,10 +45,26 @@ class TransformerLM:
         self.ln_f = LayerNorm(d)
         self.head = Linear(d, cfg.vocab_size, rng, bias=False, std=0.02)
         if self.tie_weights:
-            self.head.W = [list(col) for col in zip(*self.wte.table)]
-            self.head.gW = zeros(d, cfg.vocab_size)
+            self.head.W = self.wte.table
+            self.head.gW = self.wte.gtable
         self._ids = None
         self._dlogits = None
+
+    def train(self):
+        self.training = True
+        for blk in self.blocks:
+            blk.attn.dropout.training = True
+            blk.mlp.dropout.training = True
+            blk.dropout.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        for blk in self.blocks:
+            blk.attn.dropout.training = False
+            blk.mlp.dropout.training = False
+            blk.dropout.training = False
+        return self
 
     def forward(self, ids, targets=None, cache=None, position_offset=0):
         self._ids = ids
@@ -68,10 +85,7 @@ class TransformerLM:
         assert self._dlogits is not None, "once forward(ids, targets) cagirin"
         dx = self.head.backward(self._dlogits)
         if self.tie_weights:
-            for tid, row in enumerate(self.wte.gtable):
-                for j in range(len(row)):
-                    row[j] += self.head.gW[j][tid]
-            self.head.gW = zeros(self.cfg.d_model, self.cfg.vocab_size)
+            self.head.gW = self.wte.gtable
         dx = self.ln_f.backward(dx)
         for blk in reversed(self.blocks):
             dx = blk.backward(dx)

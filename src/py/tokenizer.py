@@ -164,6 +164,27 @@ class BPETokenizer:
     def is_special(self, i):
         return i < self.OFFSET
 
+    def to_dict(self):
+        return {"vocab_size": self.vocab_size, "merges": list(self.merges)}
+
+    @classmethod
+    def from_dict(cls, d):
+        data = d or {}
+        return cls(vocab_size=data.get("vocab_size", 1024), merges=data.get("merges", []))
+
+    def to_dict(self):
+        return {"vocab_size": self.vocab_size, "merges": [[list(a), list(b)] for a, b in self.merges]}
+
+    @classmethod
+    def from_dict(cls, data):
+        merges = []
+        for pair in data.get("merges", []):
+            if len(pair) != 2:
+                continue
+            a, b = pair
+            merges.append((bytes(a), bytes(b)))
+        return cls(vocab_size=data.get("vocab_size", 1024), merges=merges)
+
 
 class ByteTokenizer(BPETokenizer):
     def __init__(self):

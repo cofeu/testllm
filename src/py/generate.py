@@ -35,9 +35,10 @@ def sample_next(row, temperature, top_k, rng, repetition_penalty=1.0, recent=Non
     if top_k and top_k < len(scaled):
         kth = sorted(scaled, reverse=True)[top_k - 1]
         scaled = [v if v >= kth else -1e30 for v in scaled]
-    for i in recent:
-        if 0 <= i < len(scaled):
-            scaled[i] *= repetition_penalty
+    if repetition_penalty is not None and repetition_penalty > 1.0:
+        for i in recent:
+            if 0 <= i < len(scaled):
+                scaled[i] /= repetition_penalty
     m = max(scaled)
     e = [math.exp(v - m) for v in scaled]
     s = sum(e)
@@ -85,6 +86,7 @@ def main():
     p.add_argument("--max-new", type=int, default=80)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top-k", type=int, default=40)
+    p.add_argument("--repetition-penalty", type=float, default=1.15)
     p.add_argument("--seed", type=int, default=2024)
     p.add_argument("--interactive", action="store_true")
     args = p.parse_args()
@@ -93,9 +95,14 @@ def main():
     args.ckpt = resolve_path(args.ckpt)
     ckpt = load_checkpoint(args.ckpt)
     cfg = Config.from_dict(ckpt["config"])
-    dialogues = load_dialogues(cfg.data_path)
-    tok = BPETokenizer.from_corpus(dialogues, cfg.vocab_size)
+    tokenizer_payload = ckpt.get("tokenizer")
+    if tokenizer_payload is not None:
+        tok = BPETokenizer.from_dict(tokenizer_payload)
+    else:
+        dialogues = load_dialogues(cfg.data_path)
+        tok = BPETokenizer.from_corpus(dialogues, cfg.vocab_size)
     model = TransformerLM(cfg)
+    model.eval()
     model.load_state_dict(ckpt["state"])
     print(f"model yuklendi: {ckpt['step']} adim, {model.num_params():,} parametre\n")
 
@@ -112,6 +119,7 @@ def main():
                 model, tok, "K: " + user + "\nA:", cfg,
                 args.max_new, args.temperature, args.top_k,
                 random.Random(args.seed),
+                args.repetition_penalty,
             )
             print("A:", reply.strip())
     else:
@@ -119,6 +127,7 @@ def main():
             model, tok, args.prompt, cfg,
             args.max_new, args.temperature, args.top_k,
             random.Random(args.seed),
+            args.repetition_penalty,
         )
         print(full)
 
