@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.env
+
+# Egitim ciktilari / agirliklar
+*.pt
+*.pth
+*.pkl
+*.ckpt
+checkpoints/
+*.log
+
+# Arac / gecici
+.freebuff/
+tmp_debug_ckpt.pt
+.pytest_cache/

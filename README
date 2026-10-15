@@ -1,46 +1,68 @@
 ### TestLLM
-Bu proje pytorch ve ya diğer dependencyler olmadan llm çalıştırmayı hedefler
 
-Saf Python (standart kütüphane) ile sıfırdan yazılmış decoder-only transformer:
-matris çarpımı, softmax, layer norm, GELU, cross-entropy, backward (gradyan)
-hesapları, AdamW optimizasyonu ve örnekleme (temperature/top-k) — hepsi bu
-depodaki kod tarafından yapılıyor. `pip install` gerekmez.
+Küçük bir GPT dili modeli. İki bağımsız implementasyon içerir:
+
+| Dizin | Bağımlılık | Açıklama |
+|---|---|---|
+| `src/py/custom/` | yalnızca Python stdlib | Sıfırdan yazılmış transformer: matris çarpımı, softmax, layer norm, GELU, cross-entropy, backward, AdamW hepsi elle. |
+| `src/py/normal/` | torch + numpy | Aynı veri/tokenizer üzerinde nanoGPT tarzı PyTorch model; GPU (CUDA/AMP) destekli. |
 
 #### Dizin yapısı
 ```
-data/data.jsonl      egitim verisi (Turkce, {turns: [[kullanici, asistan], ...]})
-src/py/
-  ops.py             matris/vektor matematigi (matmul, softmax, ...)
-  layers.py          Linear, Embedding, LayerNorm, attention, MLP + backward
-  model.py           transformer LM + cross-entropy gradyanlari
-  tokenizer.py       bayt seviyesi tokenizer (UTF-8, 260 token)
-  dataset.py         jsonl -> token akisi -> (girdi, hedef) pencereleri
-  optim.py           AdamW, gradyan kliplemesi, lr zamanlamasi
-  config.py          hiperparametreler
-  checkpoint.py      pickle ile agirlik kaydetme/yukleme
-  train.py           egitim dongusu
-  generate.py        metin uretimi / interaktif sohbet
-  test_grads.py      sonlu fark ile gradyan dogrulamasi
-checkpoints/         egitim sonrasi agirliklar (otomatik olusturulur)
+data/data.jsonl        egitim verisi (Turkce, {turns: [[kullanici, asistan], ...]})
+src/py/custom/         saf Python implementasyonu (elle backward, stdlib)
+  ops.py               matris/vektor matematigi
+  layers.py            Linear, Embedding, LayerNorm, attention, MLP + backward
+  model.py             transformer LM + cross-entropy gradyanlari
+  tokenizer.py         BPE tokenizer (UTF-8 bayt tabanli, varsayilan vocab 1024)
+  dataset.py           jsonl -> token akisi -> (girdi, hedef) pencereleri
+  optim.py             AdamW, gradyan kliplemesi, lr zamanlamasi
+  config.py            hiperparametreler
+  checkpoint.py        pickle ile agirlik kaydetme/yukleme
+  train.py             egitim dongusu
+  generate.py          metin uretimi / interaktif sohbet
+  test_grads.py        sonlu fark ile gradyan dogrulamasi
+  augment_data.py      veri artirma scripti
+src/py/normal/         PyTorch implementasyonu (GPU destekli)
+  model.py             nn.Module GPT (SDPA, RoPE opsiyonel, weight tying)
+  dataset.py           token akisi -> tesadufi pencereler (numpy/torch)
+  tokenizer.py         ayni BPE tokenizer (kopya)
+  config.py            hiperparametreler (torch)
+  checkpoint.py        torch.save ile kaydetme/yukleme
+  train.py             egitim dongusu (AMP, cosine schedule, resume)
+  generate.py          metin uretimi / interaktif sohbet
+  augment_data.py      veri artirma scripti (kopya)
+checkpoints/           egitim sonrasi agirliklar (otomatik olusturulur)
 ```
 
-#### Kullanim (proje kokunden)
+#### Kurulum (torch + numpy)
 ```
-python3 src/py/test_grads.py                 # backward'larin dorulugu (87 kontrol)
-python3 src/py/train.py                      # varsayilan ayarlarla egitim
-python3 src/py/train.py --steps 500 --batch 4 --d-model 64 --layers 3
-python3 src/py/train.py --resume             # kaldigi yerden devam
-python3 src/py/generate.py --prompt "K: Merhaba\nA:"
-python3 src/py/generate.py --interactive     # sohbet modu
+python3 -m venv .venv
+.venv/bin/pip install torch numpy
 ```
 
-#### Varsayilan model
-d_model=48, 2 katman, 2 kafa, ffn=192, blok=48, 83.520 parametre.
-Not: saf Python yavistir; varsayilan ayarlarla adim basina ~8-9 saniye
-(batch 2 ile ~4-5 sn) gerekir. Kucuk ayarlar (--d-model 32 --layers 1
---block 32) ile denemeleri hizlandirabilirsiniz.
+#### Kullanim
+
+Saf Python (dependenciesiz):
+```
+python3 src/py/custom/test_grads.py                  # backward dogrulamasi
+python3 src/py/custom/train.py --steps 500 --batch 4 --d-model 64 --layers 3
+python3 src/py/custom/train.py --resume --steps 500
+python3 src/py/custom/generate.py --prompt "K: Merhaba\nA:" --interactive
+```
+
+PyTorch (GPU varsa otomatik cuda, AMP acik):
+```
+.venv/bin/python src/py/normal/train.py --steps 5000 --batch-size 32
+.venv/bin/python src/py/normal/train.py --resume --steps 10000
+.venv/bin/python src/py/normal/generate.py --prompt "K: Merhaba\nA:"
+.venv/bin/python src/py/normal/generate.py --interactive
+```
+
+#### Varsayilan normal (torch) model
+vocab 1024, d_model=256, 4 katman, 8 kafa, ffn=1024, blok 128, ~3.7M parametre.
+RTX 3060'da AMP ile adim basina ~5-15 ms.
 
 #### Veri formati
 Her satir bir diyalog: `{"turns": [[soru, cevap], ...]}`. Model su bicimde
-ogrenir: `<bos> K: soru\nA: cevap <eos>` (bayt tokenizer, Turkce karakterler
-dogrudan kodlanir).
+ogrenir: `<bos> K: soru\nA: cevap <eos>`.
