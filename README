@@ -66,3 +66,4 @@ RTX 3060'da AMP ile adim basina ~5-15 ms.
 #### Veri formati
 Her satir bir diyalog: `{"turns": [[soru, cevap], ...]}`. Model su bicimde
 ogrenir: `<bos> K: soru\nA: cevap <eos>`.
+NOT: Suanlık gelistirilme asamasında
