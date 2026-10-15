@@ -418,7 +418,8 @@ class DecoderOnlyLM(nn.Module):
         if generated.size(1) > self.cfg.block_size:
             generated = generated[:, -self.cfg.block_size:]
 
-        emitted_visible = False
+        forbidden_ids = {0, 1, 3}
+        produced = 0
         with torch.no_grad():
             for _ in range(max_new_tokens):
                 if generated.size(1) > self.cfg.block_size:
@@ -426,6 +427,16 @@ class DecoderOnlyLM(nn.Module):
 
                 logits = self(generated)[:, -1, :]
                 next_logits = logits / max(temperature, 1e-8)
+
+                if repetition_penalty is not None and repetition_penalty > 1.0:
+                    for prev in torch.unique(generated).tolist():
+                        prev = int(prev)
+                        if 0 <= prev < next_logits.size(-1):
+                            value = next_logits[0, prev]
+                            if value > 0:
+                                next_logits[0, prev] = value / repetition_penalty
+                            else:
+                                next_logits[0, prev] = value * repetition_penalty
 
                 if top_k is not None and top_k > 0:
                     topv, topi = torch.topk(next_logits, k=min(top_k, next_logits.size(-1)))
@@ -451,28 +462,26 @@ class DecoderOnlyLM(nn.Module):
                     probs = torch.where(probs >= min_p_value, probs, torch.zeros_like(probs))
                     probs = probs / probs.sum(dim=-1, keepdim=True)
 
-                if repetition_penalty is not None and repetition_penalty > 1.0:
-                    for bidx in range(generated.size(0)):
-                        for prev in generated[bidx].tolist():
-                            if 0 <= prev < probs.size(-1):
-                                probs[bidx, prev] = probs[bidx, prev] / repetition_penalty
-                    probs = probs / probs.sum(dim=-1, keepdim=True)
+                for fid in forbidden_ids:
+                    if 0 <= fid < probs.size(-1):
+                        probs[..., fid] = 0.0
+                if produced == 0 and 0 <= eos_id < probs.size(-1):
+                    probs[..., eos_id] = 0.0
+
+                total = probs.sum(dim=-1, keepdim=True)
+                if float(total.item()) <= 0.0:
+                    probs = torch.ones_like(probs) / probs.size(-1)
+                else:
+                    probs = probs / total
 
                 next_token = torch.multinomial(probs, num_samples=1)
                 token_id = int(next_token[0].item())
 
-                if token_id in {0, 1, 3}:
-                    if not emitted_visible:
-                        continue
-                    break
-
                 generated = torch.cat([generated, next_token], dim=1)
-                emitted_visible = True
 
                 if token_id == eos_id:
-                    if emitted_visible:
-                        break
-                    continue
+                    break
+                produced += 1
         return generated
 
 
@@ -916,9 +925,11 @@ def train_model(cfg: TrainConfig, device: torch.device | None = None, ckpt_path:
 def generate_text(model: DecoderOnlyLM, tokenizer: BPETokenizer, prompt: str, generation: GenerationConfig | None = None, device: torch.device | None = None):
     device = device or pick_device()
     generation = generation or GenerationConfig()
-    prompt_text = str(prompt or "").strip()
-    if not prompt_text:
+    prompt_text = str(prompt or "")
+    if not prompt_text.strip():
         return ""
+    if not prompt_text.endswith("\n"):
+        prompt_text = prompt_text + "\n"
 
     prompt_ids = tokenizer.encode(prompt_text)
     if not prompt_ids:
@@ -941,20 +952,12 @@ def generate_text(model: DecoderOnlyLM, tokenizer: BPETokenizer, prompt: str, ge
     )
     output_ids = generated[0].tolist()
     continuation_ids = output_ids[len(prompt_ids):]
-    if not continuation_ids:
+    visible_ids = [idx for idx in continuation_ids if idx >= tokenizer.OFFSET]
+    if not visible_ids:
         return ""
 
-    decoded = tokenizer.decode(continuation_ids)
-    if decoded.startswith(prompt_text):
-        decoded = decoded[len(prompt_text):]
-    decoded = decoded.replace("\x00", "").strip()
-    if not decoded:
-        filtered = [idx for idx in continuation_ids if idx >= tokenizer.OFFSET]
-        if filtered:
-            decoded = tokenizer.decode(filtered)
-    if decoded.startswith(prompt_text):
-        decoded = decoded[len(prompt_text):]
-    return decoded.strip()
+    decoded = tokenizer.decode(visible_ids)
+    return decoded.replace("\x00", "").strip()
 
 
 def format_chat_prompt(user_text: str, system_prompt: str | None = None, history=None):
