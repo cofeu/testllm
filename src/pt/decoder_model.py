@@ -3,7 +3,7 @@ import math
 import os
 import random
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,19 +18,20 @@ class BPETokenizer:
     BOS = 1
     EOS = 2
     UNK = 3
-    OFFSET = 4
+    IM_START = 4   # <|im_start|>
+    IM_END = 5     # <|im_end|>
+    OFFSET = 6
+    SPECIAL_STRINGS = ["<pad>", "<bos>", "<eos>", "<unk>", "<|im_start|>", "<|im_end|>"]
 
     def __init__(self, vocab_size=1024, merges=None):
-        self.specials = ["<pad>", "<bos>", "<eos>", "<unk>"]
-        self.vocab_size = max(260, int(vocab_size))
+        self.specials = list(self.SPECIAL_STRINGS)
+        self.vocab_size = max(self.OFFSET + 256, int(vocab_size))
         self.merges = list(merges or [])
-        self._id_to_token = {
-            self.PAD: self.specials[0],
-            self.BOS: self.specials[1],
-            self.EOS: self.specials[2],
-            self.UNK: self.specials[3],
-        }
-        self._token_to_id = {v: k for k, v in self._id_to_token.items()}
+        self._ranks = None
+        self._word_cache = {}
+        self._id_to_token = {i: s for i, s in enumerate(self.specials)}
+        self._token_to_id = {s: i for i, s in enumerate(self.specials)}
+        self._special_strings = set(self.specials)
         for b in range(256):
             token = bytes([b])
             idx = self.OFFSET + b
@@ -89,40 +90,62 @@ class BPETokenizer:
         if not words:
             return cls(vocab_size=vocab_size, merges=[])
 
-        pieces = [[bytes([b]) for b in word] for word in words]
+        # ---- artimli (incremental) BPE: O(merges x etkilenen kelime) ----
+        word_freq = {}
+        for word in words:
+            key = tuple(bytes([b]) for b in word)
+            if key:
+                word_freq[key] = word_freq.get(key, 0) + 1
+
+        word_list = [list(k) for k in word_freq]
+        freqs = list(word_freq.values())
+        pair_counts = Counter()
+        pair_words = defaultdict(set)
+        for wi, w in enumerate(word_list):
+            f = freqs[wi]
+            for i in range(len(w) - 1):
+                pair = (w[i], w[i + 1])
+                pair_counts[pair] += f
+                pair_words[pair].add(wi)
+
         merges = []
-        while len(pieces[0]) + len(merges) < vocab_size - cls.OFFSET:
-            counts = Counter()
-            for word in pieces:
-                for i in range(len(word) - 1):
-                    counts[(word[i], word[i + 1])] += 1
-            if not counts:
-                break
-            best_pair, best_count = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
+        max_merges = max(0, vocab_size - cls.OFFSET - 256)
+        while len(merges) < max_merges and pair_counts:
+            best_count = max(pair_counts.values())
             if best_count <= 0:
                 break
+            best_pair = max(p for p, c in pair_counts.items() if c == best_count)
             a, b = best_pair
             merged = a + b
-            new_pieces = []
-            changed = False
-            for word in pieces:
-                out = []
-                i = 0
-                while i < len(word):
-                    if i + 1 < len(word) and word[i] == a and word[i + 1] == b:
-                        out.append(merged)
-                        i += 2
-                        changed = True
+
+            affected = list(pair_words.pop(best_pair, ()))
+            pair_counts.pop(best_pair, None)
+            for wi in affected:
+                w = word_list[wi]
+                f = freqs[wi]
+                for i in range(len(w) - 1):
+                    pair = (w[i], w[i + 1])
+                    c = pair_counts.get(pair, 0) - f
+                    if c <= 0:
+                        pair_counts.pop(pair, None)
+                        pair_words.get(pair, set()).discard(wi)
                     else:
-                        out.append(word[i])
+                        pair_counts[pair] = c
+                new_word = []
+                i = 0
+                while i < len(w):
+                    if i + 1 < len(w) and w[i] == a and w[i + 1] == b:
+                        new_word.append(merged)
+                        i += 2
+                    else:
+                        new_word.append(w[i])
                         i += 1
-                new_pieces.append(out)
-            if not changed:
-                break
+                word_list[wi] = new_word
+                for i in range(len(new_word) - 1):
+                    pair = (new_word[i], new_word[i + 1])
+                    pair_counts[pair] += f
+                    pair_words[pair].add(wi)
             merges.append((a, b))
-            pieces = new_pieces
-            if len(merges) + 256 + 4 >= vocab_size:
-                break
 
         return cls(vocab_size=vocab_size, merges=merges)
 
@@ -138,19 +161,74 @@ class BPETokenizer:
                 i += 1
         return out
 
+    def _bpe(self, syms):
+        """Sembol listesini (bytes) rank-oncelikli greedy BPE ile birlestirir."""
+        if not self.merges or len(syms) < 2:
+            return list(syms)
+        if self._ranks is None or len(self._ranks) != len(self.merges):
+            self._ranks = {pair: i for i, pair in enumerate(self.merges)}
+        ranks = self._ranks
+        syms = list(syms)
+        while len(syms) >= 2:
+            best_rank = None
+            best_idx = -1
+            for i in range(len(syms) - 1):
+                r = ranks.get((syms[i], syms[i + 1]))
+                if r is not None and (best_rank is None or r < best_rank):
+                    best_rank = r
+                    best_idx = i
+            if best_idx < 0:
+                break
+            a, b = self.merges[best_rank]
+            syms[best_idx:best_idx + 2] = [a + b]
+        return syms
+
+    def _encode_word(self, word: str):
+        cached = self._word_cache.get(word)
+        if cached is not None:
+            return cached
+        syms = self._bpe([bytes([b]) for b in word.encode("utf-8")])
+        ids = [self._token_to_id.get(tok, self.UNK) for tok in syms]
+        self._word_cache[word] = ids
+        return ids
+
+    def _encode_plain(self, text: str):
+        ids = []
+        for chunk in re.findall(r"\S+|\s+", text):
+            if chunk.isspace():
+                base = self.OFFSET
+                ids.extend(base + b for b in chunk.encode("utf-8"))
+            else:
+                ids.extend(self._encode_word(chunk))
+        return ids
+
+    def _encode_bytes(self, data):
+        if not data:
+            return []
+        syms = self._bpe([bytes([b]) for b in data])
+        return [self._token_to_id.get(tok, self.UNK) for tok in syms]
+
     def encode(self, text):
         if text is None:
             return []
         if isinstance(text, (bytes, bytearray)):
-            data = bytes(text)
+            return self._encode_bytes(bytes(text))
+        data = str(text)
+        if not data:
+            return []
+        present = [s for s in self.specials if s in data]
+        if present:
+            present.sort(key=len, reverse=True)
+            pattern = "(" + "|".join(re.escape(s) for s in present) + ")"
+            parts = re.split(pattern, data)
         else:
-            data = str(text).encode("utf-8")
-        tokens = [bytes([b]) for b in data]
-        for a, b in self.merges:
-            tokens = self._merge_once(tokens, a, b)
+            parts = [data]
         ids = []
-        for tok in tokens:
-            ids.append(self._token_to_id.get(tok, self.UNK))
+        for part in parts:
+            if part in self._special_strings:
+                ids.append(self._token_to_id[part])
+            elif part:
+                ids.extend(self._encode_plain(part))
         return ids
 
     def decode(self, ids):
@@ -188,6 +266,7 @@ class TrainConfig:
     d_model: int = 128
     n_layers: int = 8
     n_head: int = 8
+    n_kv_head: int = 0  # 0 -> GQA yok (n_head'e esit)
     ff_dim: int = 512
     block_size: int = 96
     dropout: float = 0.10
@@ -286,59 +365,95 @@ def format_instruction_example(user_text: str, assistant_text: str, system_promp
     return formatter.format_messages(messages)
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (self.weight * x.to(dtype))
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: TrainConfig):
         super().__init__()
         if cfg.d_model % cfg.n_head != 0:
             raise ValueError("d_model, n_head'in kati olmali")
         self.n_head = cfg.n_head
+        self.n_kv_head = cfg.n_kv_head if cfg.n_kv_head else cfg.n_head
+        if self.n_head % self.n_kv_head != 0:
+            raise ValueError("n_head, n_kv_head'in kati olmali (GQA)")
+        self.n_rep = self.n_head // self.n_kv_head
         self.head_dim = cfg.d_model // cfg.n_head
-        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=cfg.bias)
+        self.q_proj = nn.Linear(cfg.d_model, self.n_head * self.head_dim, bias=cfg.bias)
+        self.k_proj = nn.Linear(cfg.d_model, self.n_kv_head * self.head_dim, bias=cfg.bias)
+        self.v_proj = nn.Linear(cfg.d_model, self.n_kv_head * self.head_dim, bias=cfg.bias)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
         self.attn_dropout = nn.Dropout(cfg.dropout)
         self.resid_dropout = nn.Dropout(cfg.dropout)
 
-    def forward(self, x):
+    def forward(self, x, cache=None):
         b, t, c = x.shape
-        q, k, v = self.qkv(x).split(c, dim=2)
-        q = q.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
+        q = self.q_proj(x).view(b, t, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(b, t, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(b, t, self.n_kv_head, self.head_dim).transpose(1, 2)
+
+        if cache is not None:
+            past_k, past_v = cache
+            if past_k is not None and past_k.size(2) > 0:
+                k = torch.cat([past_k, k], dim=2)
+                v = torch.cat([past_v, v], dim=2)
+        new_cache = (k, v)
+
+        if self.n_rep > 1:
+            k = k.repeat_interleave(self.n_rep, dim=1)
+            v = v.repeat_interleave(self.n_rep, dim=1)
+
+        is_causal = t > 1 and k.size(2) == t
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
             attn_mask=None,
             dropout_p=self.attn_dropout.p if self.training else 0.0,
-            is_causal=True,
+            is_causal=is_causal,
         )
         y = y.transpose(1, 2).contiguous().view(b, t, c)
-        return self.resid_dropout(self.proj(y))
+        return self.resid_dropout(self.proj(y)), new_cache
 
 
-class MLP(nn.Module):
+class SwiGLU(nn.Module):
+    """x -> down( silu(gate(x)) * up(x) ). GELU FFN yerine (Llama tarzi)."""
+
     def __init__(self, cfg: TrainConfig):
         super().__init__()
-        self.fc = nn.Linear(cfg.d_model, cfg.ff_dim, bias=cfg.bias)
-        self.proj = nn.Linear(cfg.ff_dim, cfg.d_model, bias=cfg.bias)
+        hidden = cfg.ff_dim
+        self.gate = nn.Linear(cfg.d_model, hidden, bias=cfg.bias)
+        self.up = nn.Linear(cfg.d_model, hidden, bias=cfg.bias)
+        self.down = nn.Linear(hidden, cfg.d_model, bias=cfg.bias)
         self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(self, x):
-        return self.dropout(self.proj(F.gelu(self.fc(x))))
+        return self.dropout(self.down(F.silu(self.gate(x)) * self.up(x)))
 
 
 class Block(nn.Module):
     def __init__(self, cfg: TrainConfig):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(cfg.d_model)
+        self.ln_1 = RMSNorm(cfg.d_model)
         self.attn = CausalSelfAttention(cfg)
-        self.ln_2 = nn.LayerNorm(cfg.d_model)
-        self.mlp = MLP(cfg)
+        self.ln_2 = RMSNorm(cfg.d_model)
+        self.mlp = SwiGLU(cfg)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, cache=None):
+        attn_out, new_cache = self.attn(self.ln_1(x), cache=cache)
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, new_cache
 
 
 class DecoderOnlyLM(nn.Module):
@@ -349,7 +464,7 @@ class DecoderOnlyLM(nn.Module):
         self.pos_emb = None if cfg.use_rope else nn.Embedding(cfg.block_size, cfg.d_model)
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
-        self.norm = nn.LayerNorm(cfg.d_model)
+        self.norm = RMSNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if cfg.tie_weights:
             self.head.weight = self.token_emb.weight
@@ -367,34 +482,49 @@ class DecoderOnlyLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, x: torch.Tensor, targets: torch.Tensor | None = None, loss_mask: torch.Tensor | None = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        loss_mask: torch.Tensor | None = None,
+        caches=None,
+        return_cache: bool = False,
+        pos_offset: int = 0,
+    ):
         if x.dim() != 2:
             raise ValueError(f"x must be [batch, seq], got {tuple(x.shape)}")
         b, t = x.shape
-        if t > self.cfg.block_size:
-            raise ValueError(f"sequence length {t} exceeds block_size {self.cfg.block_size}")
+        if pos_offset + t > self.cfg.block_size:
+            raise ValueError(f"sequence length {pos_offset + t} exceeds block_size {self.cfg.block_size}")
 
         h = self.token_emb(x)
         if self.pos_emb is not None:
-            pos = torch.arange(t, device=x.device).unsqueeze(0).expand(b, -1)
+            pos = torch.arange(pos_offset, pos_offset + t, device=x.device).unsqueeze(0).expand(b, -1)
             h = h + self.pos_emb(pos)
         h = self.drop(h)
-        for block in self.blocks:
-            h = block(h)
+
+        new_caches = [] if return_cache else None
+        for i, block in enumerate(self.blocks):
+            block_cache = None if caches is None else caches[i]
+            h, updated = block(h, cache=block_cache)
+            if return_cache:
+                new_caches.append(updated)
+
         h = self.norm(h)
         logits = self.head(h)
 
         if targets is None:
-            return logits
+            return (logits, new_caches) if return_cache else logits
 
         flat_logits = logits.reshape(-1, self.cfg.vocab_size)
         flat_targets = targets.reshape(-1)
-        if loss_mask is None:
-            loss = F.cross_entropy(flat_logits, flat_targets)
-        else:
+        if loss_mask is not None:
             flat_mask = loss_mask.reshape(-1).float()
-            raw = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+            raw = F.cross_entropy(flat_logits, flat_targets, reduction="none", ignore_index=-100)
             loss = (raw * flat_mask).sum() / flat_mask.sum().clamp(min=1.0)
+        else:
+            valid = (flat_targets != -100).sum().clamp(min=1)
+            loss = F.cross_entropy(flat_logits, flat_targets, reduction="sum", ignore_index=-100) / valid
         return logits, loss
 
     def generate(
@@ -407,7 +537,10 @@ class DecoderOnlyLM(nn.Module):
         min_p: float = 0.02,
         repetition_penalty: float = 1.2,
         device: torch.device | None = None,
-        eos_id: int = 0,
+        eos_id: int = 2,
+        forbidden_ids=None,
+        stop_ids=None,
+        use_cache: bool = True,
     ):
         if prompt.dim() == 1:
             prompt = prompt.unsqueeze(0)
@@ -415,17 +548,35 @@ class DecoderOnlyLM(nn.Module):
         device = device or next(self.parameters()).device
         self.eval()
         generated = prompt.to(device).clone()
-        if generated.size(1) > self.cfg.block_size:
-            generated = generated[:, -self.cfg.block_size:]
 
-        forbidden_ids = {0, 1, 3}
+        if forbidden_ids is None:
+            forbidden_ids = {0, 1, 3}
+        forbidden_ids = {int(i) for i in forbidden_ids}
+        stop_set = set()
+        if eos_id is not None:
+            stop_set.add(int(eos_id))
+        if stop_ids:
+            stop_set.update(int(i) for i in stop_ids)
+        forbidden_ids -= stop_set
+
+        caches = None
+        cache_len = 0
         produced = 0
         with torch.no_grad():
             for _ in range(max_new_tokens):
-                if generated.size(1) > self.cfg.block_size:
-                    generated = generated[:, -self.cfg.block_size:]
-
-                logits = self(generated)[:, -1, :]
+                if not use_cache:
+                    window = generated[:, -self.cfg.block_size:]
+                    logits = self(window)[:, -1, :]
+                elif caches is None or cache_len >= self.cfg.block_size:
+                    window = generated[:, -self.cfg.block_size:]
+                    out, caches = self(window, return_cache=True)
+                    cache_len = window.size(1)
+                    logits = out[:, -1, :]
+                else:
+                    last = generated[:, -1:]
+                    out, caches = self(last, caches=caches, return_cache=True, pos_offset=cache_len)
+                    cache_len += 1
+                    logits = out[:, -1, :]
                 next_logits = logits / max(temperature, 1e-8)
 
                 if repetition_penalty is not None and repetition_penalty > 1.0:
@@ -465,8 +616,10 @@ class DecoderOnlyLM(nn.Module):
                 for fid in forbidden_ids:
                     if 0 <= fid < probs.size(-1):
                         probs[..., fid] = 0.0
-                if produced == 0 and 0 <= eos_id < probs.size(-1):
-                    probs[..., eos_id] = 0.0
+                if produced == 0:
+                    for sid in stop_set:
+                        if 0 <= sid < probs.size(-1):
+                            probs[..., sid] = 0.0
 
                 total = probs.sum(dim=-1, keepdim=True)
                 if float(total.item()) <= 0.0:
@@ -479,7 +632,7 @@ class DecoderOnlyLM(nn.Module):
 
                 generated = torch.cat([generated, next_token], dim=1)
 
-                if token_id == eos_id:
+                if token_id in stop_set:
                     break
                 produced += 1
         return generated
@@ -773,15 +926,18 @@ def lr_at(step: int, cfg: TrainConfig) -> float:
 class InstructionDataset:
     """user/assistant orneklerini tek token akisina dizer, rastgele pencere keser.
 
-    loss_mask yalnizca asistan token'larinda 1 olur; system/user token'lari
-    kaybi etkilemez. Bu, ayni veriyle cok daha verimli ogrenme saglar.
+    Etiketler (labels) yalnizca asistan token'larinda gercek id olur; system/user
+    ve ozel prompt token'lari -100 yapilir. F.cross_entropy(ignore_index=-100)
+    sayesinde model sadece cevap vermeyi ogrenir, soruyu taklit etmez.
     """
+
+    IGNORE = -100
 
     def __init__(self, tokenizer, cfg: TrainConfig, texts):
         self.tok = tokenizer
         self.block_size = cfg.block_size
         base_ids = [tokenizer.BOS]
-        base_mask = [0]
+        base_labels = [self.IGNORE]
         for item in texts or []:
             if not isinstance(item, dict):
                 continue
@@ -792,46 +948,44 @@ class InstructionDataset:
             system = clean_text(item.get("system", "")) or None
             prompt = ChatPromptFormatter(system_prompt=system).format_prompt(user)
             prompt_ids = tokenizer.encode(prompt)
-            answer_ids = tokenizer.encode(assistant) + [tokenizer.EOS]
+            answer_ids = tokenizer.encode(assistant) + [tokenizer.IM_END]
             base_ids.extend(prompt_ids)
-            base_mask.extend([0] * len(prompt_ids))
+            base_labels.extend([self.IGNORE] * len(prompt_ids))
             base_ids.extend(answer_ids)
-            base_mask.extend([1] * len(answer_ids))
-        self.train_ids, self.train_mask, self.val_ids, self.val_mask = self._split(
-            base_ids, base_mask, cfg
+            base_labels.extend(answer_ids)
+        self.train_ids, self.train_labels, self.val_ids, self.val_labels = self._split(
+            base_ids, base_labels, cfg
         )
         self.n_train = len(self.train_ids)
         self.n_val = len(self.val_ids)
 
-    def _split(self, ids, mask, cfg):
+    def _split(self, ids, labels, cfg):
         need = cfg.block_size + 2
         if len(ids) < need:
             pad = need - len(ids)
             ids = ids + [self.tok.PAD] * pad
-            mask = mask + [0] * pad
+            labels = labels + [self.IGNORE] * pad
         n = len(ids)
         cut = int(n * (1.0 - cfg.val_frac))
         cut = max(cfg.block_size + 1, min(cut, n - (cfg.block_size + 1)))
-        train_ids, train_mask = ids[:cut], mask[:cut]
-        val_ids, val_mask = ids[cut:], mask[cut:]
+        train_ids, train_labels = ids[:cut], labels[:cut]
+        val_ids, val_labels = ids[cut:], labels[cut:]
         if len(val_ids) < need:
-            val_ids, val_mask = train_ids, train_mask
-        return train_ids, train_mask, val_ids, val_mask
+            val_ids, val_labels = train_ids, train_labels
+        return train_ids, train_labels, val_ids, val_labels
 
     def get_batch(self, split, batch_size, device):
         ids = self.train_ids if split == "train" else self.val_ids
-        mask = self.train_mask if split == "train" else self.val_mask
+        labels = self.train_labels if split == "train" else self.val_labels
         arr = np.asarray(ids, dtype=np.int64)
-        marr = np.asarray(mask, dtype=np.int64)
+        larr = np.asarray(labels, dtype=np.int64)
         hi = len(arr) - self.block_size - 1
         ix = np.random.randint(0, max(1, hi), size=batch_size)
         xs = np.stack([arr[i : i + self.block_size] for i in ix])
-        ys = np.stack([arr[i + 1 : i + 1 + self.block_size] for i in ix])
-        ms = np.stack([marr[i + 1 : i + 1 + self.block_size] for i in ix])
+        ys = np.stack([larr[i + 1 : i + 1 + self.block_size] for i in ix])
         return (
             torch.from_numpy(xs).to(device),
             torch.from_numpy(ys).to(device),
-            torch.from_numpy(ms).to(device),
         )
 
 
@@ -840,12 +994,12 @@ def estimate_loss(model, data, cfg, device):
     model.eval()
     losses = []
     for _ in range(cfg.eval_iters):
-        x, y, m = data.get_batch("val", cfg.batch_size, device)
+        x, y = data.get_batch("val", cfg.batch_size, device)
         if cfg.amp and device.type == "cuda":
             with torch.amp.autocast("cuda"):
-                _, loss = model(x, y, m)
+                _, loss = model(x, y)
         else:
-            _, loss = model(x, y, m)
+            _, loss = model(x, y)
         losses.append(loss.item())
     model.train()
     return sum(losses) / max(1, len(losses))
@@ -884,16 +1038,16 @@ def train_model(cfg: TrainConfig, device: torch.device | None = None, ckpt_path:
         running = 0.0
         for _ in range(max(1, cfg.grad_accum)):
             if data is not None:
-                x, y, m = data.get_batch("train", cfg.batch_size, device)
+                x, y = data.get_batch("train", cfg.batch_size, device)
             else:
                 x, y = make_synthetic_data(cfg)
-                x, y, m = x.to(device), y.to(device), None
+                x, y = x.to(device), y.to(device)
             if scaler is not None:
                 with torch.amp.autocast("cuda"):
-                    _, loss = model(x, y, m)
+                    _, loss = model(x, y)
                 scaler.scale(loss / cfg.grad_accum).backward()
             else:
-                _, loss = model(x, y, m)
+                _, loss = model(x, y)
                 (loss / cfg.grad_accum).backward()
             running += loss.item()
 
@@ -949,6 +1103,8 @@ def generate_text(model: DecoderOnlyLM, tokenizer: BPETokenizer, prompt: str, ge
         repetition_penalty=generation.repetition_penalty,
         device=device,
         eos_id=tokenizer.EOS,
+        forbidden_ids={tokenizer.PAD, tokenizer.BOS, tokenizer.UNK, tokenizer.IM_START},
+        stop_ids={tokenizer.IM_END},
     )
     output_ids = generated[0].tolist()
     continuation_ids = output_ids[len(prompt_ids):]
@@ -968,6 +1124,7 @@ def format_chat_prompt(user_text: str, system_prompt: str | None = None, history
 if __name__ == "__main__":
     data_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data"))
     data_path = os.path.join(data_dir, "data.jsonl")
+    data_large_path = os.path.join(data_dir, "data_large.jsonl")
     chml_path = os.path.join(data_dir, "chatml_instruct.jsonl")
     system_prompt = (
         "Sen Türkçe konuşan, kısa, net ve güvenilir bir yardımcı asistanısın. "
@@ -976,7 +1133,10 @@ if __name__ == "__main__":
     )
 
     dialogues = load_jsonl_dialogues(data_path)
-    corpus = build_strict_instruction_corpus(dialogues, system_prompt=system_prompt, max_examples=1200)
+    large_dialogues = load_jsonl_dialogues(data_large_path)
+    if large_dialogues:
+        dialogues = dialogues + large_dialogues
+    corpus = build_assistant_only_corpus(dialogues, system_prompt=system_prompt, max_examples=100000)
     if not corpus:
         corpus = [
             {"system": system_prompt, "user": "Merhaba", "assistant": "Merhaba! Size nasıl yardımcı olabilirim?"},
@@ -995,29 +1155,39 @@ if __name__ == "__main__":
     tokenizer_texts = [item["user"] for item in corpus if isinstance(item, dict)] + [
         item["assistant"] for item in corpus if isinstance(item, dict)
     ]
-    tokenizer = BPETokenizer.from_corpus(tokenizer_texts, vocab_size=1024)
+    tok_path = os.path.join(data_dir, "tokenizer.json")
+    if os.path.exists(tok_path):
+        with open(tok_path, "r", encoding="utf-8") as f:
+            tokenizer = BPETokenizer.from_dict(json.load(f))
+        print(f"tokenizer yuklendi: {tok_path} (vocab={tokenizer.vocab_size})")
+    else:
+        tokenizer = BPETokenizer.from_corpus(tokenizer_texts, vocab_size=2048)
+        with open(tok_path, "w", encoding="utf-8") as f:
+            json.dump(tokenizer.to_dict(), f, ensure_ascii=False)
+        print(f"tokenizer egitildi ve kaydedildi: {tok_path} (vocab={tokenizer.vocab_size})")
     cfg = TrainConfig(
         vocab_size=tokenizer.vocab_size,
         d_model=192,
         n_layers=6,
         n_head=6,
+        n_kv_head=2,
         ff_dim=768,
         block_size=128,
         dropout=0.1,
         tie_weights=True,
         learning_rate=3e-4,
         min_lr=3e-5,
-        warmup=100,
+        warmup=200,
         weight_decay=0.1,
         grad_clip=1.0,
         batch_size=32,
         grad_accum=1,
-        epochs=2000,
-        val_frac=0.1,
-        eval_every=100,
-        eval_iters=30,
-        save_every=250,
-        log_every=25,
+        epochs=6000,
+        val_frac=0.05,
+        eval_every=250,
+        eval_iters=50,
+        save_every=500,
+        log_every=100,
         amp=True,
         seed=7,
     )
@@ -1034,7 +1204,7 @@ if __name__ == "__main__":
         "Merhaba, bugün nasıl yardımcı olabilirim?",
         system_prompt=system_prompt,
     )
-    generation_cfg = GenerationConfig(max_new_tokens=42, temperature=0.28, top_k=12, top_p=0.82, repetition_penalty=1.02, min_p=0.03)
+    generation_cfg = GenerationConfig(max_new_tokens=64, temperature=0.7, top_k=40, top_p=0.9, repetition_penalty=1.1, min_p=0.02)
     generated = generate_text(model, tokenizer, prompt, generation=generation_cfg, device=device)
     print("prompt:", prompt)
     print("generated_text:", generated)
