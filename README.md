@@ -1,69 +1,111 @@
-### TestLLM
+# TestLLM
 
-Küçük bir GPT dili modeli. İki bağımsız implementasyon içerir:
+Küçük, Türkçe instruction-tuned bir GPT dil modeli. İki bağımsız
+implementasyon içerir; **kanonik olan PyTorch yoludur**.
 
-| Dizin | Bağımlılık | Açıklama |
+## Gerçek kod yapısı
+
+Kanonik PyTorch implementasyonu artık modüler bir pakettir:
+**`src/py/normal/`**. Eski tek dosya (`src/pt/decoder_model.py`) yalnızca
+geriye dönük uyumluluk için bu paketi yeniden dışa aktaran ince bir shim'dir.
+
+| Modül | Açıklama |
+|---|---|
+| `src/py/normal/config.py` | `TrainConfig`, `GenerationConfig`. |
+| `src/py/normal/tokenizer.py` | `BPETokenizer` (byte-level, özel chat token'ları, kelime-memoizasyonlu `encode`). |
+| `src/py/normal/prompt.py` | `ChatPromptFormatter`, `clean_text`. |
+| `src/py/normal/model.py` | `DecoderOnlyLM`: RMSNorm, RoPE, GQA, SwiGLU, KV cache, gradient checkpointing, gelişmiş örnekleme. |
+| `src/py/normal/corpus.py` | Veri okuma, temizleme, instruction korpusu oluşturma. |
+| `src/py/normal/dataset.py` | `InstructionDataset` — sequence packing + asistan-only loss. |
+| `src/py/normal/train.py` | AdamW (fused), cosine LR, grad accumulation, eğitim, checkpoint. |
+| `src/py/normal/generate.py` | `generate_text`. |
+| `src/py/normal/__main__.py` | `python -m src.py.normal` giriş noktası. |
+
+Diğer dizinler:
+
+| Dizin / dosya | Bağımlılık | Açıklama |
 |---|---|---|
-| `src/py/custom/` | yalnızca Python stdlib | Sıfırdan yazılmış transformer: matris çarpımı, softmax, layer norm, GELU, cross-entropy, backward, AdamW hepsi elle. |
-| `src/py/normal/` | torch + numpy | Aynı veri/tokenizer üzerinde nanoGPT tarzı PyTorch model; GPU (CUDA/AMP) destekli. |
+| `src/pt/decoder_model.py` | torch | **Shim**: `src.py.normal`'ı yeniden dışa aktarır; `python -m src.pt.decoder_model` hâlâ çalışır. |
+| `src/py/custom/` | yalnızca Python stdlib | Sıfırdan yazılmış saf-Python transformer (matris, softmax, backward, AdamW elle). Bağımsızdır. |
+| `src/py/config.py` | torch | `TrainConfig`'i genişleten `Config` + CLI arg çözümleyicileri. |
+| `src/py/{train,generate,checkpoint}.py` | torch | İnce re-export (eski import yollarını korur). |
+| `src/pt/mini_encoder.py` | torch | Bağımsız eğitici kodlayıcı demosu; `python -m src.pt.mini_encoder`. |
 
-#### Dizin yapısı
-```
-data/data.jsonl        egitim verisi (Turkce, {turns: [[kullanici, asistan], ...]})
-src/py/custom/         saf Python implementasyonu (elle backward, stdlib)
-  ops.py               matris/vektor matematigi
-  layers.py            Linear, Embedding, LayerNorm, attention, MLP + backward
-  model.py             transformer LM + cross-entropy gradyanlari
-  tokenizer.py         BPE tokenizer (UTF-8 bayt tabanli, varsayilan vocab 1024)
-  dataset.py           jsonl -> token akisi -> (girdi, hedef) pencereleri
-  optim.py             AdamW, gradyan kliplemesi, lr zamanlamasi
-  config.py            hiperparametreler
-  checkpoint.py        pickle ile agirlik kaydetme/yukleme
-  train.py             egitim dongusu
-  generate.py          metin uretimi / interaktif sohbet
-  test_grads.py        sonlu fark ile gradyan dogrulamasi
-  augment_data.py      veri artirma scripti
-src/py/normal/         PyTorch implementasyonu (GPU destekli)
-  model.py             nn.Module GPT (SDPA, RoPE opsiyonel, weight tying)
-  dataset.py           token akisi -> tesadufi pencereler (numpy/torch)
-  tokenizer.py         ayni BPE tokenizer (kopya)
-  config.py            hiperparametreler (torch)
-  checkpoint.py        torch.save ile kaydetme/yukleme
-  train.py             egitim dongusu (AMP, cosine schedule, resume)
-  generate.py          metin uretimi / interaktif sohbet
-  augment_data.py      veri artirma scripti (kopya)
-checkpoints/           egitim sonrasi agirliklar (otomatik olusturulur)
+## Veri
+
+| Dosya | İçerik |
+|---|---|
+| `data/data.jsonl` | Elle yazılmış küçük Türkçe diyalog seti. |
+| `data/data_large.jsonl` | 100.000 diyalog (`TFLai/Turkish-Alpaca` + `merve/turkish_instructions`). |
+| `data/tokenizer.json` | Önbelleklenmiş BPE tokenizer (vocab 2048). |
+| `data/chatml_instruct.jsonl` | Eğitimde kullanılan temizlenmiş chatml çıktısı (otomatik üretilir). |
+
+Format (her satır bir diyalog):
+
+```json
+{"turns": [["kullanıcı", "asistan"], ["kullanıcı", "asistan"]]}
 ```
 
-#### Kurulum (torch + numpy)
+## Kurulum
+
 ```
 python3 -m venv .venv
-.venv/bin/pip install torch numpy
+.venv/bin/pip install -r requirements.txt
 ```
 
-#### Kullanim
+`requirements.txt`: `torch`, `numpy`, `pytest`.
 
-Saf Python (dependenciesiz):
+## Kullanım
+
+### Kanonik PyTorch yolu (önerilen, GPU/CUDA/AMP destekli)
+
 ```
-python3 src/py/custom/test_grads.py                  # backward dogrulamasi
-python3 src/py/custom/train.py --steps 500 --batch 4 --d-model 64 --layers 3
+.venv/bin/python -m src.py.normal
+```
+
+Bu komut sırayla: `data/data.jsonl` + `data/data_large.jsonl` yükler →
+`build_assistant_only_corpus` ile temizler → tokenizer'ı (`data/tokenizer.json`
+varsa yükler, yoksa eğitip kaydeder) → modeli eğitir → örnek üretir →
+checkpoint'i yeniden yükleyip üretimi doğrular. Checkpoint:
+`decoder_model_ckpt.pt` (proje kökü).
+
+Varsayılan model (Llama tarzı): vocab 2048, d_model 256, 8 katman, 8 kafa,
+2 KV kafası (GQA, `n_rep=4`), ff 1024 (SwiGLU), blok 256 (**RoPE**),
+`tie_weights`, **~8.13M parametre**. Colab için ideal.
+
+### Saf Python yolu (bağımlılıksız, eğitim amaçlı)
+
+```
+python3 src/py/custom/test_grads.py                     # sonlu fark gradyan doğrulaması
+python3 src/py/custom/train.py --steps 300 --batch 4 --d-model 64 --layers 3
 python3 src/py/custom/train.py --resume --steps 500
 python3 src/py/custom/generate.py --prompt "K: Merhaba\nA:" --interactive
 ```
 
-PyTorch (GPU varsa otomatik cuda, AMP acik):
+### Testler
+
 ```
-.venv/bin/python src/py/normal/train.py --steps 5000 --batch-size 32
-.venv/bin/python src/py/normal/train.py --resume --steps 10000
-.venv/bin/python src/py/normal/generate.py --prompt "K: Merhaba\nA:"
-.venv/bin/python src/py/normal/generate.py --interactive
+PYTHONPATH=. .venv/bin/python -m pytest tests/ -q
 ```
 
-#### Varsayilan normal (torch) model
-vocab 1024, d_model=256, 4 katman, 8 kafa, ffn=1024, blok 128, ~3.7M parametre.
-RTX 3060'da AMP ile adim basina ~5-15 ms.
+## Mimari ve performans notları
 
-#### Veri formati
-Her satir bir diyalog: `{"turns": [[soru, cevap], ...]}`. Model su bicimde
-ogrenir: `<bos> K: soru\nA: cevap <eos>`.
-NOT: Suanlık gelistirilme asamasında.
+- **RoPE** (rotary positional embedding): mutlak pozisyon yerine; uzun bağlam
+  genellemesi. `use_rope=False` ile öğrenilmiş pozisyon gömlemesine düşer.
+- **GQA + KV cache**: `n_kv_head` ile grouped-query attention; `generate()`
+  anahtar/değeri önbelleğe alır (`forward(..., caches=, return_cache=, pos_offset=)`).
+- **SwiGLU + RMSNorm**: Llama tarzı FFN ve normalizasyon.
+- **Sequence packing**: `InstructionDataset` tüm örnekleri dolgusuz tek akışa
+  dizer; pencere başına token bütçesi tam dolu kalır.
+- **Asistan-only loss**: yalnızca asistan token'ları etiketlenir; system/user ve
+  prompt token'ları `-100` olur (`F.cross_entropy(ignore_index=-100)`).
+- **Gradient checkpointing + grad accumulation**: `grad_checkpointing=True` ve
+  `grad_accum>1` ile daha büyük model / daha az VRAM.
+- **Optimizer**: CUDA'da fused AdamW, yapılandırılabilir `betas`/`eps`,
+  ağırlık grubu ayrımı ve cosine + warmup LR zamanlaması.
+- **Örnekleme**: `sampler="top_p"` (varsayılan), `"typical"` veya `"mirostat"`
+  (v2); ayrıca `top_k`, `top_p`, `min_p`, `repetition_penalty`.
+- **Özel token'lar**: `<pad>`=0, `<bos>`=1, `<eos>`=2, `<unk>`=3,
+  `<|im_start|>`=4, `<|im_end|>`=5, bayt aralığı 6'dan başlar (`OFFSET=6`).
+
+Geliştirme aşamasındadır.

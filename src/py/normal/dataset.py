@@ -1,101 +1,81 @@
-"""Compatibility layer: the normal dataset path follows the PT implementation."""
+"""Instruction veri seti: ornekleri dolgusuz bloklara paketler (sequence packing).
 
-import json
-import random
+Etiketler (labels) yalnizca asistan token'larinda gercek id olur; system/user
+ve ozel prompt token'lari -100 yapilir. F.cross_entropy(ignore_index=-100)
+sayesinde model sadece cevap vermeyi ogrenir, soruyu taklit etmez.
+
+Sequence packing: tum ornekler tek bir token akisina dizildigi icin pencere
+ici dolgu yoktur; egitim token butcesi tamamen dolu kalir.
+"""
 
 import numpy as np
 import torch
 
-from src.pt.decoder_model import ChatPromptFormatter, clean_text
-
-PROMPT_PREFIX = "<|im_start|>user\n"
-RESPONSE_PREFIX = "<|im_start|>assistant\n"
-SYSTEM_PROMPT = (
-    "Sen Türkçe konuşan, kısa ve net cevap veren bir yardımcı asistanısın. "
-    "Cevaplar kısa, anlaşılır ve Türkçe olsun."
-)
-
-normalize_text = clean_text
+from .config import TrainConfig
+from .prompt import ChatPromptFormatter, clean_text
+from .tokenizer import BPETokenizer
 
 
-def normalize_turns(turns):
-    out = []
-    for pair in turns or []:
-        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-            continue
-        user = normalize_text(pair[0])
-        assistant = normalize_text(pair[1])
-        if not user or not assistant:
-            continue
-        out.append((user, assistant))
-    return out
+class InstructionDataset:
+    IGNORE = -100
 
+    def __init__(self, tokenizer: BPETokenizer, cfg: TrainConfig, texts):
+        self.tok = tokenizer
+        self.block_size = cfg.block_size
 
-def load_dialogues(path):
-    rows = []
-    try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                turns = obj.get("turns", [])
-                cleaned = normalize_turns(turns)
-                if cleaned:
-                    rows.append(cleaned)
-    except OSError:
-        return []
-    return rows
+        base_ids = [tokenizer.BOS]
+        base_labels = [self.IGNORE]
+        n_examples = 0
+        for item in texts or []:
+            if not isinstance(item, dict):
+                continue
+            user = clean_text(item.get("user", ""))
+            assistant = clean_text(item.get("assistant", ""))
+            if not user or not assistant:
+                continue
+            system = clean_text(item.get("system", "")) or None
+            prompt = ChatPromptFormatter(system_prompt=system).format_prompt(user)
+            prompt_ids = tokenizer.encode(prompt)
+            answer_ids = tokenizer.encode(assistant) + [tokenizer.IM_END]
+            base_ids.extend(prompt_ids)
+            base_labels.extend([self.IGNORE] * len(prompt_ids))
+            base_ids.extend(answer_ids)
+            base_labels.extend(answer_ids)
+            n_examples += 1
 
+        self.n_examples = n_examples
+        self.total_tokens = len(base_ids)
+        self.learnable_tokens = sum(1 for x in base_labels if x != self.IGNORE)
+        self.packing_ratio = self.total_tokens / max(1, (self.total_tokens + self.block_size - 1) // self.block_size) / self.block_size
 
-def build_stream(tokenizer, turns, system_prompt=None):
-    formatter = ChatPromptFormatter(system_prompt=system_prompt or SYSTEM_PROMPT)
-    ids = [tokenizer.BOS]
-    for user, assistant in normalize_turns(turns):
-        text = formatter.format_messages([
-            {"role": "user", "content": user},
-            {"role": "assistant", "content": assistant},
-        ])
-        ids.extend(tokenizer.encode(text))
-        ids.append(tokenizer.EOS)
-    return ids
+        train_ids, train_labels, val_ids, val_labels = self._split(base_ids, base_labels, cfg)
+        self.train_x = torch.tensor(train_ids, dtype=torch.long)
+        self.train_y = torch.tensor(train_labels, dtype=torch.long)
+        self.val_x = torch.tensor(val_ids, dtype=torch.long)
+        self.val_y = torch.tensor(val_labels, dtype=torch.long)
+        self.n_train = len(train_ids)
+        self.n_val = len(val_ids)
 
-
-class ChatDataset:
-    def __init__(self, tokenizer, dialogues, block_size, val_frac=0.1, seed=1337, system_prompt=None):
-        self.block_size = block_size
-        streams = [build_stream(tokenizer, turns, system_prompt=system_prompt) for turns in dialogues]
-        rng = random.Random(seed)
-        order = list(range(len(streams)))
-        rng.shuffle(order)
-        n_val = max(1, int(len(streams) * val_frac)) if len(streams) > 1 else 0
-        val_set = set(order[:n_val])
-        train_streams = [s for i, s in enumerate(streams) if i not in val_set]
-        val_streams = [s for i, s in enumerate(streams) if i in val_set]
-        if not train_streams:
-            train_streams = streams[:1]
-        self.train = self._concat(train_streams)
-        self.val = self._concat(val_streams) if val_streams else self.train[:1]
-
-    @staticmethod
-    def _concat(streams):
-        return np.concatenate([np.asarray(s, dtype=np.int64) for s in streams])
+    def _split(self, ids, labels, cfg):
+        need = cfg.block_size + 2
+        if len(ids) < need:
+            pad = need - len(ids)
+            ids = ids + [self.tok.PAD] * pad
+            labels = labels + [self.IGNORE] * pad
+        n = len(ids)
+        cut = int(n * (1.0 - cfg.val_frac))
+        cut = max(cfg.block_size + 1, min(cut, n - (cfg.block_size + 1)))
+        train_ids, train_labels = ids[:cut], labels[:cut]
+        val_ids, val_labels = ids[cut:], labels[cut:]
+        if len(val_ids) < need:
+            val_ids, val_labels = train_ids, train_labels
+        return train_ids, train_labels, val_ids, val_labels
 
     def get_batch(self, split, batch_size, device):
-        src = self.train if split == "train" else self.val
-        n = len(src)
-        if n < self.block_size + 1:
-            pad = np.full(self.block_size + 1 - n, 0, dtype=np.int64)
-            src = np.concatenate([src, pad])
-            n = len(src)
-        hi = n - self.block_size - 1
+        arr = self.train_x if split == "train" else self.val_x
+        lab = self.train_y if split == "train" else self.val_y
+        hi = arr.numel() - self.block_size - 1
         ix = torch.randint(0, max(1, hi), (batch_size,))
-        xs = np.stack([src[i : i + self.block_size] for i in ix.tolist()])
-        ys = np.stack([src[i + 1 : i + 1 + self.block_size] for i in ix.tolist()])
-        x = torch.from_numpy(np.ascontiguousarray(xs)).to(device)
-        y = torch.from_numpy(np.ascontiguousarray(ys)).to(device)
-        return x, y
+        xs = torch.stack([arr[i:i + self.block_size] for i in ix])
+        ys = torch.stack([lab[i + 1:i + 1 + self.block_size] for i in ix])
+        return xs.to(device), ys.to(device)

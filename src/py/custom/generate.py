@@ -1,8 +1,8 @@
 """Egitilmis modelden token token uretim (temperature + top-k orneklemesi).
 
 Kullanim (proje kokunden):
-    python3 src/py/generate.py --prompt "K: Merhaba\nA:"
-    python3 src/py/generate.py --interactive
+    python3 src/py/custom/generate.py --prompt "K: Merhaba\nA:"
+    python3 src/py/custom/generate.py --interactive
 """
 
 import argparse

@@ -1,7 +1,7 @@
 """Egitim dongusu: veri -> forward/backward -> AdamW -> checkpoint.
 
 Kullanim (proje kokunden):
-    python3 src/py/train.py --steps 300
+    python3 src/py/custom/train.py --steps 300
 """
 
 import argparse

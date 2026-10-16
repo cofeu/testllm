@@ -83,9 +83,11 @@ class GenerationPromptTests(unittest.TestCase):
         ]]
         corpus = build_assistant_only_corpus(dialogues, system_prompt="Sen yardımcı asistanısın.")
 
-        self.assertEqual(len(corpus), 2)
-        self.assertTrue(all(item["assistant"].lower().startswith("python") or item["assistant"].lower().startswith("merhaba") is False for item in corpus))
+        # Iki "Merhaba" cevabi prompt echo'su olarak elenir; yalniz Python ornegi kalir.
+        self.assertEqual(len(corpus), 1)
         self.assertTrue(all(item["assistant"] for item in corpus))
+        self.assertFalse(corpus[0]["assistant"].lower().startswith("merhaba"))
+        self.assertTrue(corpus[0]["assistant"].lower().startswith("python"))
 
 
 if __name__ == "__main__":
