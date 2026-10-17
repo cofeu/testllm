@@ -53,7 +53,8 @@ class Seq2SeqDataset:
             if not user or not assistant:
                 continue
             system = clean_text(item.get("system", "")) or None
-            prompt = ChatPromptFormatter(system_prompt=system).format_prompt(user)
+            history = item.get("history") or None
+            prompt = ChatPromptFormatter(system_prompt=system).format_prompt(user, history=history)
 
             src_ids = tokenizer.encode(prompt)
             if len(src_ids) > self.block_size:

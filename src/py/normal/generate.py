@@ -89,11 +89,16 @@ def main(argv=None):
         sampler=args.sampler,
     )
     tokenizer = _tokenizer_from_checkpoint_or(args.ckpt, root)
+    history = []
 
     def ask(text):
-        prompt = format_chat_prompt(text, system_prompt=args.system)
+        prompt = format_chat_prompt(text, system_prompt=args.system, history=history)
         out = generate_text(model, tokenizer, prompt, generation=gen, device=device)
         print(f"asistan> {out}")
+        history.append({"role": "user", "content": text})
+        history.append({"role": "assistant", "content": out})
+        del history[:-8]
+        return out
 
     if args.interactive:
         print("Cikmak icin 'q' yazin.")

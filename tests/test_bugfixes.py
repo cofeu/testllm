@@ -189,6 +189,36 @@ class BugfixTests(unittest.TestCase):
         self.assertEqual(int(out[0, 0]), tok.BOS)
         self.assertGreaterEqual(out.size(1), 1)
 
+    def test_multiturn_history_in_corpus_and_prompt(self):
+        from src.py.normal.corpus import build_assistant_only_corpus
+        from src.py.normal.prompt import ChatPromptFormatter
+
+        dialogues = [[["ilk soru", "ilk cevap burada"], ["ikinci soru", "ikinci cevap burada"]]]
+        corpus = build_assistant_only_corpus(dialogues)
+        self.assertEqual(len(corpus), 2)
+        # Ilk turun gecmisi bos, ikinci turun gecmisi ilk turu icerir.
+        self.assertEqual(corpus[0]["history"], [])
+        self.assertEqual([m["content"] for m in corpus[1]["history"]], ["ilk soru", "ilk cevap burada"])
+
+        prompt = ChatPromptFormatter().format_prompt(
+            corpus[1]["user"], history=corpus[1]["history"])
+        # Gecmis, guncel kullanici mesajindan ONCE ve dogru sirada yer alir.
+        self.assertIn("ilk soru", prompt)
+        self.assertLess(prompt.index("ilk soru"), prompt.index("ikinci soru"))
+        self.assertTrue(prompt.rstrip().endswith("<|im_start|>assistant"))
+
+    def test_multiturn_history_lengthens_dataset_source(self):
+        texts = [{"user": "ikinci soru", "assistant": "ikinci cevap burada", "system": "",
+                  "history": [{"role": "user", "content": "ilk soru burada"},
+                              {"role": "assistant", "content": "ilk cevap burada"}]}]
+        plain = [{"user": "ikinci soru", "assistant": "ikinci cevap burada", "system": ""}]
+        tok = _tok(["ilk soru burada", "ilk cevap burada", "ikinci soru", "ikinci cevap burada"])
+        cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
+                          ff_dim=0, block_size=128, batch_size=1)
+        with_hist = Seq2SeqDataset(tok, cfg, texts).get_batch("train", 1, torch.device("cpu"))[0]
+        without = Seq2SeqDataset(tok, cfg, plain).get_batch("train", 1, torch.device("cpu"))[0]
+        self.assertGreater(int((with_hist != tok.PAD).sum()), int((without != tok.PAD).sum()))
+
 
 if __name__ == "__main__":
     unittest.main()

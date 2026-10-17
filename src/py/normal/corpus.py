@@ -34,7 +34,7 @@ def load_jsonl_dialogues(path: str):
     return rows
 
 
-def build_instruction_corpus(dialogues, system_prompt: str | None = None, max_turns: int | None = None):
+def build_instruction_corpus(dialogues, system_prompt: str | None = None, max_turns: int | None = None, max_history: int = 8):
     system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
     corpus = []
     seen = set()
@@ -42,6 +42,7 @@ def build_instruction_corpus(dialogues, system_prompt: str | None = None, max_tu
     for dialogue in dialogues[:max_turns] if max_turns else dialogues:
         if not isinstance(dialogue, (list, tuple)):
             continue
+        history = []  # onceki turlar: [{"role","content"}, ...]
         for turn in dialogue:
             if not isinstance(turn, (list, tuple)) or len(turn) != 2:
                 continue
@@ -52,15 +53,20 @@ def build_instruction_corpus(dialogues, system_prompt: str | None = None, max_tu
                 continue
             if _has_special_token(user_text) or _has_special_token(assistant_text):
                 continue
-            key = (user_text.lower(), assistant_text.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            corpus.append({
-                "system": system_prompt,
-                "user": user_text,
-                "assistant": assistant_text,
-            })
+            key = (tuple((m["role"], m["content"]) for m in history),
+                   user_text.lower(), assistant_text.lower())
+            if key not in seen:
+                seen.add(key)
+                corpus.append({
+                    "system": system_prompt,
+                    "user": user_text,
+                    "assistant": assistant_text,
+                    "history": list(history),
+                })
+            history.append({"role": "user", "content": user_text})
+            history.append({"role": "assistant", "content": assistant_text})
+            if max_history and len(history) > max_history:
+                history = history[-max_history:]
     return corpus
 
 
@@ -80,7 +86,12 @@ def build_assistant_only_corpus(dialogues, system_prompt: str | None = None, max
             continue
         if _has_special_token(user) or _has_special_token(assistant):
             continue
-        key = (user.lower(), assistant.lower())
+        history = [
+            {"role": m.get("role"), "content": clean_text(m.get("content", ""))}
+            for m in item.get("history", [])
+            if clean_text(m.get("content", ""))
+        ]
+        key = (tuple((m["role"], m["content"]) for m in history), user.lower(), assistant.lower())
         if key in seen:
             continue
         seen.add(key)
@@ -88,6 +99,7 @@ def build_assistant_only_corpus(dialogues, system_prompt: str | None = None, max
             "system": clean_text(item.get("system", system_prompt or "")),
             "user": user,
             "assistant": assistant,
+            "history": history,
         })
     return clean
 
