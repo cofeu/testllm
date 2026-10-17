@@ -475,6 +475,7 @@ class EncoderDecoderLM(nn.Module):
         min_p: float = 0.02,
         repetition_penalty: float = 1.2,
         device: torch.device | None = None,
+        pad_id: int = 0,
         bos_id: int = 1,
         eos_id: int = 2,
         forbidden_ids=None,
@@ -497,7 +498,7 @@ class EncoderDecoderLM(nn.Module):
         max_new_tokens = max(0, min(int(max_new_tokens), self.cfg.block_size - 1))
 
         if forbidden_ids is None:
-            forbidden_ids = {0, 1, 3}
+            forbidden_ids = {pad_id, bos_id, 3}
         forbidden_ids = {int(i) for i in forbidden_ids}
         stop_set = set()
         if eos_id is not None:
@@ -506,7 +507,7 @@ class EncoderDecoderLM(nn.Module):
             stop_set.update(int(i) for i in stop_ids)
         forbidden_ids -= stop_set
 
-        src_pad = src == 0
+        src_pad = src == int(pad_id)
         if not bool(src_pad.any()):
             src_pad = None
 

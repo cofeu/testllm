@@ -5,14 +5,19 @@ Her ornek bir (kaynak, hedef) ciftidir:
   hedef  : asistan cevabi -> decoder (teacher forcing).
 
 Decoder girdisi `<bos>` ile baslar; hedefler bir kaydirilmis halidir ve cevabin
-sonuna tam olarak bir `<|im_end|>` (EOS) eklenir. Dolgu (pad) etiketleri -100
-yapilir; boylece kayip yalnizca gercek cevap token'larindan hesaplanir.
+sonuna tam olarak bir `<|im_end|>` (EOS) eklenir. Cevap blok boyutuna sigmiyorsa
+kirpilir ve bu durumda EOS EKLENMEZ (model yarida kesmeyi ogrenmesin).
 
 Bellek/hesap verimliligi:
   * Satirlar int32 olarak duz (flat) dizilerde + ofset dizisinde saklanir
     (int64'e gore yari bellek; blok boyutuna onceden doldurulmaz).
-  * `get_batch` yalnizca o batch'teki en uzun diziye kadar doldurur (dinamik pad),
-    boylece encoder/decoder hesaplarinin cogu dolguya gitmez.
+  * Uzunluga gore gruplama (length bucketing): ornekler `max(src_len, tgt_len)`
+    8'lik kovalara ayrilir; `get_batch` once rastgele bir kova secer (ornek
+    sayisina gore agirlikli), sonra o kovadan ornekler. Boylece ayni batch'e
+    benzer uzunluktaki ornekler duser ve tek uzun ornek kisa ornekleri onun
+    boyuna cekmez.
+  * Her tensor kendi batch maksimumuna (8'in katina yuvarlanmis) doldurulur;
+    src ve tgt bagimsiz doldurulur, dolgu minimize edilir.
 
 Encoder dolgusu self-attention'da; encoder dolgusu decoder cross-attention'inda;
 decoder dolgusu decoder self-attention'inda maskelenir (model.forward'a pad
@@ -28,13 +33,16 @@ from .config import TrainConfig
 from .prompt import ChatPromptFormatter, clean_text
 from .tokenizer import BPETokenizer
 
+PAD_MULTIPLE = 8
+
 
 class Seq2SeqDataset:
     IGNORE = -100
 
-    def __init__(self, tokenizer: BPETokenizer, cfg: TrainConfig, texts):
+    def __init__(self, tokenizer: BPETokenizer, cfg: TrainConfig, texts, bucket_width: int = 8):
         self.tok = tokenizer
         self.block_size = cfg.block_size
+        self.bucket_width = max(1, int(bucket_width))
 
         src_rows, in_rows, out_rows = [], [], []
         for item in texts or []:
@@ -52,13 +60,16 @@ class Seq2SeqDataset:
                 # Sondaki (en guncel) baglami koru; kullanicinin sorusu prompt'un
                 # sonunda yer alir, bastan kirpmak soruyu silebilir.
                 src_ids = src_ids[-self.block_size:]
-            # Cevaplayi encoder'a koymuyoruz; IM_END'i BIR kez (tgt_out sonunda) ekle.
-            answer = tokenizer.encode(assistant)[: self.block_size - 1]
+
+            answer = tokenizer.encode(assistant)
+            truncated = len(answer) > self.block_size - 1
+            answer = answer[: self.block_size - 1]
             if not src_ids or not answer:
                 continue
 
             tgt_in = [tokenizer.BOS] + answer
-            tgt_out = answer + [tokenizer.IM_END]
+            # Kirpilan cevaba EOS eklemeyiz: aksi halde model yarida bitirmeyi ogrenir.
+            tgt_out = list(answer) if truncated else answer + [tokenizer.IM_END]
             src_rows.append(src_ids)
             in_rows.append(tgt_in)
             out_rows.append(tgt_out)
@@ -87,9 +98,17 @@ class Seq2SeqDataset:
                               [in_rows[i] for i in val_idx],
                               [out_rows[i] for i in val_idx]),
         }
+        self._buckets, self._bucket_of = {}, {}
+        for k, v in self._store.items():
+            arrays, bucket_of = self._bucketize(v["src"][1], v["out"][1])
+            self._buckets[k] = arrays
+            self._bucket_of[k] = bucket_of
         self.n_train = len(train_idx)
         self.n_val = len(val_idx)
 
+    # ------------------------------------------------------------------
+    # Depolama
+    # ------------------------------------------------------------------
     @staticmethod
     def _flat(rows):
         rows = rows or [[]]
@@ -109,12 +128,45 @@ class Seq2SeqDataset:
             "out": self._flat(out_rows),
         }
 
+    # ------------------------------------------------------------------
+    # Uzunluga gore kovalama
+    # ------------------------------------------------------------------
+    def _bucketize(self, src_offsets, out_offsets):
+        """Ornekleri `max(src_len, tgt_len)` 8'lik kovalara ayirir.
+
+        Doner: (kovalarin pozisyon dizileri listesi, pozisyon -> kova indeksi).
+        """
+        n = src_offsets.size - 1
+        keys = np.empty(n, dtype=np.int64)
+        for pos in range(n):
+            s = int(src_offsets[pos + 1] - src_offsets[pos])
+            t = int(out_offsets[pos + 1] - out_offsets[pos])
+            keys[pos] = max(s, t) // self.bucket_width
+        groups = {}
+        for pos, k in enumerate(keys.tolist()):
+            groups.setdefault(int(k), []).append(pos)
+        arrays = []
+        bucket_of = np.empty(n, dtype=np.int64)
+        for bi, positions in enumerate(groups.values()):
+            arr = np.array(positions, dtype=np.int64)
+            arrays.append(arr)
+            bucket_of[arr] = bi
+        return arrays, bucket_of
+
+    # ------------------------------------------------------------------
+    # Batch
+    # ------------------------------------------------------------------
     @staticmethod
-    def _batch(store, ix, fill):
+    def _round_up(max_len, cap):
+        rounded = ((max_len + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
+        return min(cap, max(max_len, rounded))
+
+    def _batch(self, store, ix, fill):
         data, offsets = store
         starts = offsets[ix]
         ends = offsets[ix + 1]
-        max_len = max(1, int((ends - starts).max()))
+        raw_max = max(1, int((ends - starts).max()))
+        max_len = self._round_up(raw_max, self.block_size)
         out = np.full((len(ix), max_len), fill, dtype=np.int64)
         for j in range(len(ix)):
             s, e = int(starts[j]), int(ends[j])
@@ -123,9 +175,14 @@ class Seq2SeqDataset:
         return out
 
     def get_batch(self, split, batch_size, device):
-        store = self._store["train" if split == "train" else "val"]
+        key = "train" if split == "train" else "val"
+        store = self._store[key]
         n = store["src"][1].size - 1
-        ix = np.random.randint(0, max(1, n), size=batch_size)
+        # Rastgele bir ornek sec, onun kovasini kullan (kova secimi ornek
+        # sayisina gore agirlikli olur), sonra o kovadan batch'i doldur.
+        probe = int(np.random.randint(0, max(1, n)))
+        bucket = self._buckets[key][int(self._bucket_of[key][probe])]
+        ix = bucket[np.random.randint(0, bucket.size, size=batch_size)]
         src = self._batch(store["src"], ix, self.tok.PAD)
         tgt_in = self._batch(store["in"], ix, self.tok.PAD)
         tgt_out = self._batch(store["out"], ix, self.IGNORE)

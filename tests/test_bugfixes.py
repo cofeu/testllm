@@ -146,6 +146,49 @@ class BugfixTests(unittest.TestCase):
         self.assertTrue(torch.equal(a, b))
         self.assertFalse(torch.equal(a, c))
 
+    def test_length_bucketing_groups_similar_lengths(self):
+        texts = _small_texts(8)
+        tok = _tok([t["user"] for t in texts] + [t["assistant"] for t in texts])
+        cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
+                          ff_dim=0, block_size=200, batch_size=4, val_frac=0.25)
+        ds = Seq2SeqDataset(tok, cfg, texts)
+
+        # [5,6,7,100,101,20] token'lik satirlar; 8'lik kovalar:
+        # 5,6,7 -> kova 0 ; 20 -> kova 2 ; 100,101 -> kova 12
+        lengths = [5, 6, 7, 100, 101, 20]
+        _, off_s = Seq2SeqDataset._flat([[0] * l for l in lengths])
+        _, off_o = Seq2SeqDataset._flat([[0] * l for l in lengths])
+        _, bucket_of = ds._bucketize(off_s, off_o)
+
+        self.assertEqual(bucket_of[0], bucket_of[1])
+        self.assertEqual(bucket_of[1], bucket_of[2])
+        self.assertEqual(bucket_of[3], bucket_of[4])
+        self.assertNotEqual(bucket_of[0], bucket_of[3])
+        self.assertNotEqual(bucket_of[5], bucket_of[3])
+
+    def test_truncated_answer_has_no_eos(self):
+        texts = [{"user": "kisa soru", "assistant": "kelime " * 80}]
+        tok = _tok([t["user"] for t in texts] + [t["assistant"] for t in texts])
+        cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
+                          ff_dim=0, block_size=16, dropout=0.0, batch_size=1)
+        ds = Seq2SeqDataset(tok, cfg, texts)
+        _, tgt_in, tgt_out = ds.get_batch("train", 1, torch.device("cpu"))
+        row_out = tgt_out[0][tgt_out[0] != ds.IGNORE]
+        # Kirpilan cevaba EOS eklenmez (yarida bitirmeyi ogrenmesin).
+        self.assertEqual(int((row_out == tok.IM_END).sum()), 0)
+        self.assertEqual(row_out.numel(), cfg.block_size - 1)
+
+    def test_generate_accepts_pad_id(self):
+        tok = _tok(["merhaba dunya", "nasilsin"])
+        cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
+                          ff_dim=0, block_size=32)
+        model = EncoderDecoderLM(cfg)
+        src = torch.tensor([[tok.BOS] + tok.encode("merhaba") + [tok.PAD, tok.PAD]])
+        out = model.generate(src, max_new_tokens=3, pad_id=tok.PAD, bos_id=tok.BOS,
+                             eos_id=tok.EOS, device=torch.device("cpu"))
+        self.assertEqual(int(out[0, 0]), tok.BOS)
+        self.assertGreaterEqual(out.size(1), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
