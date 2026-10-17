@@ -41,6 +41,8 @@ Diğer dizinler:
 |---|---|
 | `data/data.jsonl` | Elle yazılmış küçük Türkçe diyalog seti. |
 | `data/data_large.jsonl` | 100.000 diyalog (`TFLai/Turkish-Alpaca` + `merve/turkish_instructions`). |
+| `data/instruct.jsonl` | Talimat sohbeti havuzu (chatml dönüşümü + elle yazılan örnekler, çok turlu). |
+| `data/reasoning.jsonl` | Adım adım düşünme (CoT) havuzu (`scripts/make_reasoning_data.py` ile üretilir). |
 | `data/tokenizer.json` | Önbelleklenmiş BPE tokenizer (vocab 2048). |
 | `data/chatml_instruct.jsonl` | Eğitimde kullanılan temizlenmiş chatml çıktısı (otomatik üretilir). |
 
@@ -49,6 +51,17 @@ Format (her satır bir diyalog):
 ```json
 {"turns": [["kullanıcı", "asistan"], ["kullanıcı", "asistan"]]}
 ```
+
+ChatML formatı (`{"messages": [...]}`) da okunur; `load_jsonl_dialogues` bunu
+otomatik olarak `turns`'a çevirir. Asistan cevaplarında satır sonları korunur
+(adım adım çözümler ve yapılandırılmış çıktı çok satırlı kalır).
+
+Muhakeme verisini üretmek için:
+
+```
+.venv/bin/python scripts/make_reasoning_data.py --out data/reasoning.jsonl --per-category 120
+```
+
 
 ## Kurulum
 
@@ -85,6 +98,12 @@ cross-attention vardır.
 .venv/bin/python -m src.py.normal.train --steps 4000 --qk-norm --batch-size 32
 .venv/bin/python -m src.py.normal.train --resume
 
+# veri dosyaları: --data + tekrarlanabilir --extra-data
+.venv/bin/python -m src.py.normal.train \
+    --data data/instruct.jsonl \
+    --extra-data data/reasoning.jsonl \
+    --extra-data data/data_large.jsonl
+
 # GPT tarzı varyant (LayerNorm + GELU + öğrenilmiş pozisyon + bias)
 .venv/bin/python -m src.py.normal.train --norm layernorm --activation gelu --no-rope
 
@@ -92,6 +111,10 @@ cross-attention vardır.
 .venv/bin/python -m src.py.normal.generate --prompt "Merhaba" --sampler typical
 .venv/bin/python -m src.py.normal.generate --interactive
 ```
+
+`--extra-data` birden fazla kez verilebilir; verilmezse `data/data.jsonl`
+kullanılır. Argüman verilme sırası korunur ve `max_examples` sınırı eleme
+sonrası uygulanır.
 
 Öne çıkan eğitim argümanları: `--d-model --n-layers --n-head --n-kv-head
 --ff-dim --block-size --lr --warmup --grad-accum --dropout --qk-norm --no-rope

@@ -219,6 +219,111 @@ class BugfixTests(unittest.TestCase):
         without = Seq2SeqDataset(tok, cfg, plain).get_batch("train", 1, torch.device("cpu"))[0]
         self.assertGreater(int((with_hist != tok.PAD).sum()), int((without != tok.PAD).sum()))
 
+    def test_clean_text_keep_newlines(self):
+        from src.py.normal.prompt import clean_text
+
+        raw = "Adım 1:  bir   şey\n\n\nAdım 2:\tiki\n"
+        flat = clean_text(raw)
+        self.assertNotIn("\n", flat)
+        kept = clean_text(raw, keep_newlines=True)
+        self.assertIn("\n", kept)
+        self.assertIn("Adım 1:", kept)
+        self.assertIn("Adım 2:", kept)
+        self.assertNotIn("\n\n\n", kept)
+        # Ayni satir icindeki fazla bosluk yine sadelesir.
+        self.assertIn("Adım 1: bir şey", kept)
+
+    def test_messages_to_turns(self):
+        from src.py.normal.corpus import messages_to_turns
+
+        messages = [
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "birinci"},
+            {"role": "assistant", "content": "cevap bir"},
+            {"role": "user", "content": "ikinci"},
+            {"role": "user", "content": "devam"},
+            {"role": "assistant", "content": "cevap iki"},
+            {"role": "user", "content": "cevapsiz"},
+        ]
+        turns = messages_to_turns(messages)
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0], ["birinci", "cevap bir"])
+        self.assertEqual(turns[1], ["ikinci\ndevam", "cevap iki"])
+
+    def test_load_jsonl_reads_messages(self):
+        from src.py.normal.corpus import load_jsonl_dialogues
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "chatml.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"messages": [
+                    {"role": "user", "content": "selam"},
+                    {"role": "assistant", "content": "merhaba"},
+                ]}, ensure_ascii=False) + "\n")
+            rows = load_jsonl_dialogues(path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0][0], "selam")
+        self.assertEqual(rows[0][0][1], "merhaba")
+
+    def test_max_examples_applied_after_filtering(self):
+        # Ilk ornekler elenir (kisa); max_examples eleme SONRASI uygulanmali.
+        dialogues = [[["ab", "x"], ["gecerli soru", f"gecerli cevap {i} burada"]] for i in range(5)]
+        corpus = build_assistant_only_corpus(dialogues, max_examples=4)
+        self.assertEqual(len(corpus), 4)
+        self.assertTrue(all(len(c["assistant"]) >= 4 for c in corpus))
+
+    def test_corpus_preserves_multiline_answer(self):
+        dialogues = [[["adım adım", "Adım 1: düşün\nAdım 2: uygula\nSonuç: tamam"]]]
+        corpus = build_assistant_only_corpus(dialogues)
+        self.assertEqual(len(corpus), 1)
+        self.assertIn("\n", corpus[0]["assistant"])
+        self.assertIn("Adım 1", corpus[0]["assistant"])
+
+    def test_generate_unk_id_param(self):
+        tok = _tok(["merhaba dunya"])
+        cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
+                          ff_dim=0, block_size=16)
+        model = EncoderDecoderLM(cfg)
+        src = torch.tensor([[tok.BOS] + tok.encode("merhaba")])
+        out = model.generate(src, max_new_tokens=2, pad_id=tok.PAD, bos_id=tok.BOS,
+                             eos_id=tok.EOS, unk_id=tok.UNK, device=torch.device("cpu"))
+        gen = out[0].tolist()
+        # UNK uretilmemeli (forbidden).
+        self.assertNotIn(tok.UNK, gen)
+
+    def test_encoder_self_attention_bidirectional(self):
+        # Encoder cift yonlu olmali: SON kaynak token'i degisince ILK encoder
+        # konumunun temsili de degismeli. (Eski hata: encoder'a yanlislikla
+        # nedensel maske uygulaniyordu.)
+        tok = _tok(["kelime"] * 8)
+        cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
+                          ff_dim=0, block_size=16, dropout=0.0)
+        model = EncoderDecoderLM(cfg).eval()
+        ids = [tok.OFFSET + 1, tok.OFFSET + 2, tok.OFFSET + 3, tok.OFFSET + 4]
+        src1 = torch.tensor([ids])
+        src2 = torch.tensor([ids[:3] + [tok.OFFSET + 5]])
+        with torch.no_grad():
+            m1 = model.encode(src1)
+            m2 = model.encode(src2)
+        self.assertFalse(torch.allclose(m1[0, 0], m2[0, 0], atol=1e-6))
+
+    def test_decoder_self_attention_causal(self):
+        # Decoder nedensel kalmali: hedefin SON token'i degisince ILK konumun
+        # logit'i degismemeli.
+        tok = _tok(["kelime"] * 8)
+        cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
+                          ff_dim=0, block_size=16, dropout=0.0)
+        model = EncoderDecoderLM(cfg).eval()
+        src = torch.tensor([[tok.OFFSET + 1, tok.OFFSET + 2, tok.OFFSET + 3]])
+        ids = [tok.BOS, tok.OFFSET + 4, tok.OFFSET + 5, tok.OFFSET + 6]
+        tgt1 = torch.tensor([ids])
+        tgt2 = torch.tensor([ids[:3] + [tok.OFFSET + 7]])
+        with torch.no_grad():
+            a = model(src, tgt1)
+            b = model(src, tgt2)
+        self.assertTrue(torch.allclose(a[0, 0], b[0, 0], atol=1e-5))
+        self.assertFalse(torch.allclose(a[0, -1], b[0, -1]))
+
 
 if __name__ == "__main__":
     unittest.main()

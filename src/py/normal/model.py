@@ -177,10 +177,11 @@ class Attention(nn.Module):
                     q, k, v, dropout_p=dropout_p, is_causal=(self.causal and t > 1 and offset == 0)
                 )
         else:
-            if self.cross:
-                allowed = torch.ones(t, key_len, dtype=torch.bool, device=q.device)
-            else:
-                allowed = torch.ones(t, key_len, dtype=torch.bool, device=q.device).tril()
+            # cross-attention: tum kaynagi gorur. self-attention: yalniz `causal`
+            # ise nedensel maske uygulanir (encoder cift yonlu kalir).
+            allowed = torch.ones(t, key_len, dtype=torch.bool, device=q.device)
+            if self.causal:
+                allowed = allowed.tril()
             if pad_mask is not None:
                 allowed = allowed[None, None] & (~pad_mask[:, None, None, :])
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed, dropout_p=dropout_p, is_causal=False)
@@ -423,7 +424,7 @@ class EncoderDecoderLM(nn.Module):
         if top_k is not None and top_k > 0:
             topv, topi = torch.topk(next_logits, k=min(top_k, next_logits.size(-1)))
             mask = torch.full_like(next_logits, float("-inf"))
-            mask.scatter_(1, topi, topv)
+            mask.scatter_(-1, topi, topv)
             next_logits = mask
 
         probs = torch.softmax(next_logits, dim=-1)
@@ -454,7 +455,7 @@ class EncoderDecoderLM(nn.Module):
             remove[..., 1:] = remove[..., :-1].clone()
             remove[..., 0] = False
             keep = torch.zeros_like(probs, dtype=torch.bool)
-            keep.scatter_(1, sorted_indices, ~remove)
+            keep.scatter_(-1, sorted_indices, ~remove)
             probs = probs.masked_fill(~keep, 0.0)
             probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
 
@@ -478,6 +479,7 @@ class EncoderDecoderLM(nn.Module):
         pad_id: int = 0,
         bos_id: int = 1,
         eos_id: int = 2,
+        unk_id: int = 3,
         forbidden_ids=None,
         stop_ids=None,
         use_cache: bool = True,
@@ -498,7 +500,7 @@ class EncoderDecoderLM(nn.Module):
         max_new_tokens = max(0, min(int(max_new_tokens), self.cfg.block_size - 1))
 
         if forbidden_ids is None:
-            forbidden_ids = {pad_id, bos_id, 3}
+            forbidden_ids = {pad_id, bos_id, unk_id}
         forbidden_ids = {int(i) for i in forbidden_ids}
         stop_set = set()
         if eos_id is not None:

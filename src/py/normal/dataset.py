@@ -48,11 +48,11 @@ class Seq2SeqDataset:
         for item in texts or []:
             if not isinstance(item, dict):
                 continue
-            user = clean_text(item.get("user", ""))
-            assistant = clean_text(item.get("assistant", ""))
+            user = clean_text(item.get("user", ""), keep_newlines=True)
+            assistant = clean_text(item.get("assistant", ""), keep_newlines=True)
             if not user or not assistant:
                 continue
-            system = clean_text(item.get("system", "")) or None
+            system = clean_text(item.get("system", ""), keep_newlines=True) or None
             history = item.get("history") or None
             prompt = ChatPromptFormatter(system_prompt=system).format_prompt(user, history=history)
 

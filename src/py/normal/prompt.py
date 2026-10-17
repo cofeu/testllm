@@ -3,12 +3,23 @@
 import re
 
 DEFAULT_SYSTEM_PROMPT = "Sen kısa, doğal ve yardımcı Türkçe cevaplar veren bir asistansın."
+REASONING_SYSTEM_PROMPT = (
+    "Sen Türkçe düşünen bir asistansın. Zor sorularda önce adım adım düşünür, "
+    "sonra net bir cevap verirsin."
+)
 
 
-def clean_text(value):
+def clean_text(value, keep_newlines: bool = False):
     if value is None:
         return ""
-    text = str(value).strip().replace("\r", " ").replace("\n", " ")
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    if keep_newlines:
+        # Satir sonlarini koru; yatay bosluklari sadelestir, 3+ bos satiri 2'ye indir.
+        lines = [re.sub(r"[^\S\n]+", " ", line).strip() for line in text.split("\n")]
+        text = "\n".join(lines)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+    text = text.replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -24,7 +35,7 @@ class ChatPromptFormatter:
         blocks = [f"<|im_start|>system\n{self.system_prompt}\n<|im_end|>"]
         for msg in messages:
             role = str(msg.get("role", "user")).strip().lower()
-            content = clean_text(str(msg.get("content", "")).strip())
+            content = clean_text(str(msg.get("content", "")), keep_newlines=True)
             if not content:
                 continue
             if role not in {"user", "assistant"}:

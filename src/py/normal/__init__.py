@@ -32,6 +32,7 @@ from .corpus import (
     load_chatml_dataset,
     load_jsonl_dialogues,
     make_synthetic_data,
+    messages_to_turns,
 )
 from .dataset import Seq2SeqDataset
 from .generate import generate_text
@@ -52,6 +53,7 @@ from .model import (
 from .prompt import (
     ChatPromptFormatter,
     DEFAULT_SYSTEM_PROMPT,
+    REASONING_SYSTEM_PROMPT,
     clean_text,
     format_chat_prompt,
     format_instruction_example,
@@ -80,6 +82,7 @@ __all__ = [
     # prompt
     "ChatPromptFormatter",
     "DEFAULT_SYSTEM_PROMPT",
+    "REASONING_SYSTEM_PROMPT",
     "clean_text",
     "format_chat_prompt",
     "format_instruction_example",
@@ -98,6 +101,7 @@ __all__ = [
     "default_swiglu_hidden",
     # corpus
     "load_jsonl_dialogues",
+    "messages_to_turns",
     "build_instruction_corpus",
     "build_assistant_only_corpus",
     "build_long_clean_chat_corpus",
