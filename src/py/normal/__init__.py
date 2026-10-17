@@ -1,17 +1,24 @@
-"""Kanonik PyTorch implementasyonu (Llama tarzi).
+"""Kanonik PyTorch implementasyonu (Llama + GPT hibrit).
+
+Llama: RMSNorm, RoPE, GQA, SwiGLU, pre-norm. GPT: LayerNorm, GELU, ogrenilmis
+pozisyon, bias, dropout, weight tying -- `norm_type`/`activation`/`use_rope`/`bias`
+ile secilir. Modern: QK-Norm (Llama 3), RoPE scaling, z-loss, KV cache,
+gradient checkpointing, sequence packing, typical/mirostat ornekleme, resume.
 
 Modul yapisi:
   config     : TrainConfig, GenerationConfig
   tokenizer  : BPETokenizer
   prompt     : ChatPromptFormatter, clean_text
-  model      : DecoderOnlyLM (RMSNorm, RoPE, GQA, SwiGLU, KV cache)
+  model      : DecoderOnlyLM (RMSNorm/LayerNorm, RoPE, GQA, SwiGLU/GELU, KV cache)
   corpus     : veri okuma/temizleme/korpus olusturma
   dataset    : InstructionDataset (sequence packing)
-  train      : optimizer, LR schedule, egitim, checkpoint
+  train      : optimizer, LR schedule, egitim, checkpoint, resume
   generate   : generate_text
 
 Calistirma:
-  python -m src.py.normal
+  python -m src.py.normal            # tam pipeline (egit + uret)
+  python -m src.py.normal.train      # CLI egitim (--resume vb.)
+  python -m src.py.normal.generate   # CLI uretim (--interactive)
 """
 
 from .config import GenerationConfig, TrainConfig
@@ -33,10 +40,14 @@ from .model import (
     Block,
     CausalSelfAttention,
     DecoderOnlyLM,
+    MLP,
     RMSNorm,
     RotaryEmbedding,
     SwiGLU,
     apply_rotary,
+    default_swiglu_hidden,
+    make_ffn,
+    make_norm,
 )
 from .prompt import (
     ChatPromptFormatter,
@@ -73,10 +84,14 @@ __all__ = [
     "DecoderOnlyLM",
     "CausalSelfAttention",
     "SwiGLU",
+    "MLP",
     "Block",
     "RMSNorm",
     "RotaryEmbedding",
     "apply_rotary",
+    "make_norm",
+    "make_ffn",
+    "default_swiglu_hidden",
     # corpus
     "load_jsonl_dialogues",
     "build_instruction_corpus",

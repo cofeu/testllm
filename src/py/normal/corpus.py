@@ -30,11 +30,7 @@ def load_jsonl_dialogues(path: str):
 
 
 def build_instruction_corpus(dialogues, system_prompt: str | None = None, max_turns: int | None = None):
-    system_prompt = system_prompt or (
-        "Sen Türkçe konuşan, yardımsever, net ve güvenilir bir asistansın. "
-        "Cevaplar kısa, anlaşılır, samimi ve işlevsel olsun. "
-        "Kullanıcı sorusunu tekrar etme; yalnızca asistanın yanıtını üret."
-    )
+    system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
     corpus = []
     seen = set()
 

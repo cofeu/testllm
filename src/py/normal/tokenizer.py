@@ -80,7 +80,7 @@ class BPETokenizer:
             text = str(text).strip()
             if not text:
                 continue
-            words.extend(bytes(part, "utf-8") for part in re.findall(r"\S+", text))
+            words.extend(bytes(part, "utf-8") for part in re.findall(r" ?[^\s]+|\s+", text))
 
         if not words:
             return cls(vocab_size=vocab_size, merges=[])
@@ -188,13 +188,11 @@ class BPETokenizer:
         return ids
 
     def _encode_plain(self, text: str):
+        # GPT-2 tarzi: her kelimeye (varsa) basindaki bosluk dahil edilir; boylece
+        # " " ayri bir token olmaz ve ayni baglama daha fazla metin sigar.
         ids = []
-        for chunk in re.findall(r"\S+|\s+", text):
-            if chunk.isspace():
-                base = self.OFFSET
-                ids.extend(base + b for b in chunk.encode("utf-8"))
-            else:
-                ids.extend(self._encode_word(chunk))
+        for chunk in re.findall(r" ?[^\s]+|\s+", text):
+            ids.extend(self._encode_word(chunk))
         return ids
 
     def _encode_bytes(self, data):

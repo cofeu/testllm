@@ -1,10 +1,10 @@
-"""Llama tarzi decoder-only model: RMSNorm, RoPE, GQA, SwiGLU, KV cache.
+"""Llama + GPT tarzi decoder-only model.
 
-Ek yetenekler:
-  * RoPE (rotary positional embedding) -- uzun baglam genellemesi
-  * GQA (grouped-query attention) + KV cache -- hizli uretim
-  * gradient checkpointing -- dusuk bellek
-  * gelismis ornekleme: top_p, typical, mirostat v2
+Llama tarafi: RMSNorm, RoPE, GQA, SwiGLU, pre-norm, bias yok.
+GPT tarafi  : ogrenilmis pozisyon, LayerNorm, GELU FFN, dropout, weight tying --
+              hepsi `norm_type`/`activation`/`use_rope`/`bias` ile secilebilir.
+Modern      : QK-Norm (Llama 3), RoPE scaling (uzun baglam), z-loss, KV cache,
+              gradient checkpointing, typical/mirostat ornekleme.
 """
 
 import math
@@ -14,6 +14,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import GenerationConfig, TrainConfig
+
+
+def default_swiglu_hidden(d_model: int, multiple_of: int = 64, ffn_dim_multiplier: float = 1.0) -> int:
+    """Llama kurali: ~8/3 * d_model, `multiple_of` katina yuvarlanmis."""
+    hidden = int(2 * (4 * d_model) / 3)
+    hidden = int(ffn_dim_multiplier * hidden)
+    return multiple_of * ((hidden + multiple_of - 1) // multiple_of)
 
 
 class RMSNorm(nn.Module):
@@ -29,22 +36,30 @@ class RMSNorm(nn.Module):
         return self.weight * x.to(dtype)
 
 
-class RotaryEmbedding(nn.Module):
-    """Rotary positional embedding; pozisyon ofseti ile KV cache uyumlu."""
+def make_norm(dim: int, cfg: TrainConfig) -> nn.Module:
+    """norm_type ile RMSNorm (Llama) veya LayerNorm (GPT) secer."""
+    if cfg.norm_type == "layernorm":
+        return nn.LayerNorm(dim, eps=1e-5)
+    return RMSNorm(dim, eps=1e-5)
 
-    def __init__(self, dim: int, max_seq_len: int = 512, base: float = 10000.0):
+
+class RotaryEmbedding(nn.Module):
+    """RoPE; pozisyon ofseti (KV cache) ve dogrusal olceklemeyi destekler."""
+
+    def __init__(self, dim: int, max_seq_len: int = 512, base: float = 10000.0, scaling_factor: float = 1.0):
         super().__init__()
         if dim % 2 != 0:
             raise ValueError("RoPE icin head_dim cift olmali")
         self.dim = dim
         self.base = base
+        self.scaling_factor = max(1e-6, float(scaling_factor))
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._build(max_seq_len)
 
     def _build(self, seq_len: int):
         self.max_seq_len = seq_len
-        t = torch.arange(seq_len, dtype=torch.float32)
+        t = torch.arange(seq_len, dtype=torch.float32) / self.scaling_factor
         freqs = torch.outer(t, self.inv_freq.float())
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
@@ -89,11 +104,20 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(cfg.dropout)
         self.resid_dropout = nn.Dropout(cfg.dropout)
 
+        self.qk_norm = cfg.qk_norm
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+
     def forward(self, x, cache=None, rope=None, pos_offset: int = 0):
         b, t, c = x.shape
         q = self.q_proj(x).view(b, t, self.n_head, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(b, t, self.n_kv_head, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(b, t, self.n_kv_head, self.head_dim).transpose(1, 2)
+
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         if rope is not None:
             cos, sin = rope(x, pos_offset=pos_offset)
@@ -110,21 +134,22 @@ class CausalSelfAttention(nn.Module):
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
-        is_causal = t > 1 and k.size(2) == t
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            dropout_p=self.attn_dropout.p if self.training else 0.0,
-            is_causal=is_causal,
-        )
+        key_len = k.size(2)
+        offset = key_len - t
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        if t > 1 and offset > 0:
+            # Cache var ve segmentte birden fazla sorgu: nedensel maskeyi mutlak
+            # konuma hizala (sorgu i, key_len-t+i dahil geriye bakabilir).
+            mask = torch.ones(t, key_len, dtype=torch.bool, device=q.device).tril(diagonal=offset)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout_p, is_causal=False)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, is_causal=(t > 1 and offset == 0))
         y = y.transpose(1, 2).contiguous().view(b, t, c)
         return self.resid_dropout(self.proj(y)), new_cache
 
 
 class SwiGLU(nn.Module):
-    """x -> down( silu(gate(x)) * up(x) ). GELU FFN yerine (Llama tarzi)."""
+    """Llama FFN: x -> down( silu(gate(x)) * up(x) )."""
 
     def __init__(self, cfg: TrainConfig):
         super().__init__()
@@ -138,13 +163,33 @@ class SwiGLU(nn.Module):
         return self.dropout(self.down(F.silu(self.gate(x)) * self.up(x)))
 
 
+class MLP(nn.Module):
+    """GPT FFN: x -> proj( gelu(fc(x)) )."""
+
+    def __init__(self, cfg: TrainConfig):
+        super().__init__()
+        self.fc = nn.Linear(cfg.d_model, cfg.ff_dim, bias=cfg.bias)
+        self.proj = nn.Linear(cfg.ff_dim, cfg.d_model, bias=cfg.bias)
+        self.dropout = nn.Dropout(cfg.dropout)
+
+    def forward(self, x):
+        return self.dropout(self.proj(F.gelu(self.fc(x))))
+
+
+def make_ffn(cfg: TrainConfig) -> nn.Module:
+    """activation ile SwiGLU (Llama) veya GELU MLP (GPT) secer."""
+    if cfg.activation == "gelu":
+        return MLP(cfg)
+    return SwiGLU(cfg)
+
+
 class Block(nn.Module):
     def __init__(self, cfg: TrainConfig):
         super().__init__()
-        self.ln_1 = RMSNorm(cfg.d_model)
+        self.ln_1 = make_norm(cfg.d_model, cfg)
         self.attn = CausalSelfAttention(cfg)
-        self.ln_2 = RMSNorm(cfg.d_model)
-        self.mlp = SwiGLU(cfg)
+        self.ln_2 = make_norm(cfg.d_model, cfg)
+        self.mlp = make_ffn(cfg)
         self.grad_checkpointing = cfg.grad_checkpointing
 
     def _attn_mlp(self, x, cache, rope, pos_offset):
@@ -175,19 +220,21 @@ class DecoderOnlyLM(nn.Module):
         self.rope = None
         self.pos_emb = None
         if cfg.use_rope and head_dim % 2 == 0:
-            self.rope = RotaryEmbedding(head_dim, max_seq_len=cfg.block_size, base=cfg.rope_theta)
+            scaling = cfg.rope_scaling_factor if cfg.rope_scaling == "linear" else 1.0
+            self.rope = RotaryEmbedding(head_dim, max_seq_len=cfg.block_size, base=cfg.rope_theta, scaling_factor=scaling)
         else:
+            # GPT tarzi ogrenilmis pozisyon gomlemesi
             self.pos_emb = nn.Embedding(cfg.block_size, cfg.d_model)
 
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
-        self.norm = RMSNorm(cfg.d_model)
+        self.norm = make_norm(cfg.d_model, cfg)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if cfg.tie_weights:
             self.head.weight = self.token_emb.weight
         self.apply(self._init_weights)
         for name, p in self.named_parameters():
-            if name.endswith("proj.weight") and p.ndim == 2:
+            if name.endswith(("attn.proj.weight", "mlp.down.weight", "mlp.proj.weight")) and p.ndim == 2:
                 nn.init.normal_(p, mean=0.0, std=0.02 / (2 * cfg.n_layers) ** 0.5)
 
     @staticmethod
@@ -247,6 +294,10 @@ class DecoderOnlyLM(nn.Module):
                 flat_logits, flat_targets, reduction="mean",
                 ignore_index=-100, label_smoothing=self.cfg.label_smoothing,
             )
+
+        if self.cfg.z_loss > 0.0:
+            log_z = torch.logsumexp(flat_logits.float(), dim=-1)
+            loss = loss + self.cfg.z_loss * (log_z ** 2).mean().to(loss.dtype)
         return logits, loss
 
     # ------------------------------------------------------------------
@@ -258,13 +309,9 @@ class DecoderOnlyLM(nn.Module):
         if sampler == "mirostat":
             probs = torch.softmax(next_logits, dim=-1)
             sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
-            cumulative = torch.cumsum(sorted_probs, dim=-1)
-            cond = cumulative >= (1.0 - sorted_probs)
-            has = cond.any(dim=-1)
-            first = torch.argmax(cond.float(), dim=-1)
-            k = torch.where(has, first, torch.full_like(first, probs.size(-1) - 1))
-            rank = torch.arange(probs.size(-1), device=probs.device).unsqueeze(0)
-            keep_sorted = rank <= k.unsqueeze(-1)
+            surprise = -torch.log2(sorted_probs.clamp_min(1e-12))
+            keep_sorted = surprise <= mu
+            keep_sorted[..., 0] = True  # en olasi token her zaman kalir
             keep = torch.zeros_like(probs, dtype=torch.bool)
             keep.scatter_(-1, sorted_idx, keep_sorted)
             probs = probs.masked_fill(~keep, 0.0)

@@ -11,7 +11,7 @@ from .config import GenerationConfig, TrainConfig
 from .corpus import build_assistant_only_corpus, load_jsonl_dialogues
 from .generate import generate_text
 from .model import DecoderOnlyLM
-from .prompt import format_chat_prompt
+from .prompt import DEFAULT_SYSTEM_PROMPT, format_chat_prompt
 from .tokenizer import BPETokenizer
 from .train import load_checkpoint, pick_device, train_model
 
@@ -60,11 +60,7 @@ def load_corpus(system_prompt):
 
 
 def main():
-    system_prompt = (
-        "Sen Türkçe konuşan, kısa, net ve güvenilir bir yardımcı asistanısın. "
-        "Cevaplar kısa, anlaşılır, samimi ve işlevsel olsun. "
-        "Asla kullanıcı sorusunu tekrar etme; yalnızca asistanın doğal, öz ve yardımcı cevabını üret."
-    )
+    system_prompt = DEFAULT_SYSTEM_PROMPT
 
     corpus = load_corpus(system_prompt)
     tokenizer = build_tokenizer(corpus, str(DATA_DIR / "tokenizer.json"))

@@ -2,11 +2,7 @@
 
 import re
 
-DEFAULT_SYSTEM_PROMPT = (
-    "Sen Türkçe konuşan, yardımsever, net ve güvenilir bir yardımcı asistanısın. "
-    "Yalnızca asistanın cevabını yaz, kullanıcı sorusunu veya sistem metnini tekrar etme. "
-    "Cevaplar kısa, anlaşılır, doğal ve Türkçe olsun; hiçbir etiketi, başlığı veya tekrarı yeniden üretme."
-)
+DEFAULT_SYSTEM_PROMPT = "Sen kısa, doğal ve yardımcı Türkçe cevaplar veren bir asistansın."
 
 
 def clean_text(value):
@@ -39,11 +35,9 @@ class ChatPromptFormatter:
         return "\n".join(blocks)
 
     def format_prompt(self, user_text: str, history=None):
-        history = history or []
-        messages = [{"role": "user", "content": user_text}]
-        for entry in history:
-            if isinstance(entry, dict):
-                messages.append(entry)
+        # Gecmis once, guncel kullanici mesaji en sona (cok turlu dogru sira).
+        messages = list(history or [])
+        messages.append({"role": "user", "content": user_text})
         return self.format_messages(messages)
 
 

@@ -19,9 +19,15 @@ class TrainConfig:
     block_size: int = 128
     dropout: float = 0.10
     tie_weights: bool = True
-    bias: bool = False
-    use_rope: bool = True       # mutlak pozisyon yerine RoPE
+    bias: bool = False          # Llama: bias yok; GPT: bias var
+    use_rope: bool = True       # RoPE (Llama) vs ogrenilmis pozisyon (GPT)
     rope_theta: float = 10000.0
+    rope_scaling: str = "none"  # "none" | "linear" (uzun baglam)
+    rope_scaling_factor: float = 1.0
+    norm_type: str = "rmsnorm"  # "rmsnorm" (Llama) | "layernorm" (GPT)
+    activation: str = "swiglu"  # "swiglu" (Llama) | "gelu" (GPT)
+    qk_norm: bool = False       # Llama 3: q/k uzerine RMSNorm (stabilite)
+    z_loss: float = 0.0         # 0 -> kapali; >0 ise logit z-loss reg.
     grad_checkpointing: bool = False  # bellek icin aktivasyon yeniden hesaplama
 
     # ---- optimizasyon ----
@@ -37,6 +43,7 @@ class TrainConfig:
     grad_accum: int = 1
     epochs: int = 200           # toplam optimizasyon adimi
     fused_adamw: bool = True    # CUDA'da fused AdamW (varsa)
+    resume: bool = False        # ckpt varsa optimizer+step ile devam et
 
     # ---- degerlendirme / kayit ----
     val_frac: float = 0.1

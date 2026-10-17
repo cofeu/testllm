@@ -49,3 +49,75 @@ def generate_text(model: DecoderOnlyLM, tokenizer: BPETokenizer, prompt: str, ge
 
     decoded = tokenizer.decode(visible_ids)
     return decoded.replace("\x00", "").strip()
+
+
+def main(argv=None):
+    """CLI:  python -m src.py.normal.generate --prompt "Merhaba" [--interactive]"""
+    import argparse
+    from pathlib import Path
+
+    from .prompt import DEFAULT_SYSTEM_PROMPT, format_chat_prompt
+    from .train import load_checkpoint, pick_device
+
+    root = Path(__file__).resolve().parents[3]
+    ap = argparse.ArgumentParser(description="Modelden metin uret")
+    ap.add_argument("--ckpt", default=str(root / "decoder_model_ckpt.pt"))
+    ap.add_argument("--prompt", default="Merhaba, bugün nasıl yardımcı olabilirim?")
+    ap.add_argument("--system", default=DEFAULT_SYSTEM_PROMPT)
+    ap.add_argument("--max-new-tokens", type=int, default=64)
+    ap.add_argument("--temperature", type=float, default=0.7)
+    ap.add_argument("--top-k", type=int, default=40)
+    ap.add_argument("--top-p", type=float, default=0.9)
+    ap.add_argument("--min-p", type=float, default=0.02)
+    ap.add_argument("--repetition-penalty", type=float, default=1.1)
+    ap.add_argument("--sampler", choices=["top_p", "typical", "mirostat"], default="top_p")
+    ap.add_argument("--device", default=None)
+    ap.add_argument("--interactive", action="store_true")
+    args = ap.parse_args(argv)
+
+    device = pick_device() if args.device is None else torch.device(args.device)
+    model, _ = load_checkpoint(args.ckpt, device=device)
+    gen = GenerationConfig(
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        min_p=args.min_p,
+        repetition_penalty=args.repetition_penalty,
+        sampler=args.sampler,
+    )
+    tokenizer = _tokenizer_from_checkpoint_or(root)
+
+    def ask(text):
+        prompt = format_chat_prompt(text, system_prompt=args.system)
+        out = generate_text(model, tokenizer, prompt, generation=gen, device=device)
+        print(f"asistan> {out}")
+
+    if args.interactive:
+        print("Cikmak icin 'q' yazin.")
+        while True:
+            try:
+                text = input("siz> ").strip()
+            except EOFError:
+                break
+            if text.lower() in {"q", "quit", "exit"}:
+                break
+            if text:
+                ask(text)
+    else:
+        ask(args.prompt)
+
+
+def _tokenizer_from_checkpoint_or(root):
+    import json
+    from pathlib import Path
+
+    for candidate in (Path(root) / "data" / "tokenizer.json",):
+        if candidate.exists():
+            with open(candidate, "r", encoding="utf-8") as f:
+                return BPETokenizer.from_dict(json.load(f))
+    raise FileNotFoundError("tokenizer.json bulunamadi; once egitim calistirin")
+
+
+if __name__ == "__main__":
+    main()
