@@ -153,7 +153,8 @@ class SwiGLU(nn.Module):
 
     def __init__(self, cfg: TrainConfig):
         super().__init__()
-        hidden = cfg.ff_dim
+        hidden = cfg.ff_dim if cfg.ff_dim > 0 else default_swiglu_hidden(cfg.d_model)
+        self.hidden = hidden
         self.gate = nn.Linear(cfg.d_model, hidden, bias=cfg.bias)
         self.up = nn.Linear(cfg.d_model, hidden, bias=cfg.bias)
         self.down = nn.Linear(hidden, cfg.d_model, bias=cfg.bias)
@@ -168,8 +169,10 @@ class MLP(nn.Module):
 
     def __init__(self, cfg: TrainConfig):
         super().__init__()
-        self.fc = nn.Linear(cfg.d_model, cfg.ff_dim, bias=cfg.bias)
-        self.proj = nn.Linear(cfg.ff_dim, cfg.d_model, bias=cfg.bias)
+        hidden = cfg.ff_dim if cfg.ff_dim > 0 else 4 * cfg.d_model
+        self.hidden = hidden
+        self.fc = nn.Linear(cfg.d_model, hidden, bias=cfg.bias)
+        self.proj = nn.Linear(hidden, cfg.d_model, bias=cfg.bias)
         self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(self, x):
@@ -237,6 +240,10 @@ class DecoderOnlyLM(nn.Module):
             if name.endswith(("attn.proj.weight", "mlp.down.weight", "mlp.proj.weight")) and p.ndim == 2:
                 nn.init.normal_(p, mean=0.0, std=0.02 / (2 * cfg.n_layers) ** 0.5)
 
+    @property
+    def uses_rope(self) -> bool:
+        return self.rope is not None
+
     @staticmethod
     def _init_weights(module):
         if isinstance(module, nn.Linear):
@@ -282,22 +289,26 @@ class DecoderOnlyLM(nn.Module):
 
         flat_logits = logits.reshape(-1, self.cfg.vocab_size)
         flat_targets = targets.reshape(-1)
+        valid = flat_targets != -100
+        # reduction="none" + gecerli token sayisina bolme: pencere tamamen prompt
+        # oldugunda (tum hedefler -100) 0/0=nan olusmasini onler.
+        raw = F.cross_entropy(
+            flat_logits, flat_targets, reduction="none",
+            ignore_index=-100, label_smoothing=self.cfg.label_smoothing,
+        )
         if loss_mask is not None:
-            flat_mask = loss_mask.reshape(-1).float()
-            raw = F.cross_entropy(
-                flat_logits, flat_targets, reduction="none",
-                ignore_index=-100, label_smoothing=self.cfg.label_smoothing,
-            )
+            flat_mask = loss_mask.reshape(-1).float() * valid.float()
             loss = (raw * flat_mask).sum() / flat_mask.sum().clamp(min=1.0)
         else:
-            loss = F.cross_entropy(
-                flat_logits, flat_targets, reduction="mean",
-                ignore_index=-100, label_smoothing=self.cfg.label_smoothing,
-            )
+            loss = raw.sum() / valid.sum().clamp(min=1)
 
         if self.cfg.z_loss > 0.0:
             log_z = torch.logsumexp(flat_logits.float(), dim=-1)
-            loss = loss + self.cfg.z_loss * (log_z ** 2).mean().to(loss.dtype)
+            if bool(valid.any()):
+                z = (log_z[valid] ** 2).mean()
+            else:
+                z = log_z.new_zeros(())
+            loss = loss + self.cfg.z_loss * z.to(loss.dtype)
         return logits, loss
 
     # ------------------------------------------------------------------
@@ -384,6 +395,7 @@ class DecoderOnlyLM(nn.Module):
         device = device or next(self.parameters()).device
         self.eval()
         generated = prompt.to(device).clone()
+        prompt_len = generated.size(1)
 
         if forbidden_ids is None:
             forbidden_ids = {0, 1, 3}
@@ -418,14 +430,12 @@ class DecoderOnlyLM(nn.Module):
                 next_logits = logits / max(temperature, 1e-8)
 
                 if repetition_penalty is not None and repetition_penalty > 1.0:
-                    for prev in torch.unique(generated).tolist():
-                        prev = int(prev)
-                        if 0 <= prev < next_logits.size(-1):
-                            value = next_logits[0, prev]
-                            if value > 0:
-                                next_logits[0, prev] = value / repetition_penalty
-                            else:
-                                next_logits[0, prev] = value * repetition_penalty
+                    seen = generated[0, prompt_len:]
+                    if seen.numel() > 0:
+                        uniq = torch.unique(seen)
+                        vals = next_logits[0, uniq]
+                        vals = torch.where(vals > 0, vals / repetition_penalty, vals * repetition_penalty)
+                        next_logits[0, uniq] = vals
 
                 full_probs = None
                 if sampler == "mirostat":

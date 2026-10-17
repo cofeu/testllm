@@ -4,7 +4,7 @@ Kanonik tanimlar burada yasar; `src/pt/decoder_model.py` ve `src/py/config.py`
 bu modulu yeniden disa aktarir.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, fields
 
 
 @dataclass
@@ -15,7 +15,7 @@ class TrainConfig:
     n_layers: int = 8
     n_head: int = 8
     n_kv_head: int = 0          # 0 -> GQA yok (n_head'e esit)
-    ff_dim: int = 512           # SwiGLU gizli boyutu
+    ff_dim: int = 0             # 0 -> otomatik: Llama kurali (SwiGLU) / 4*d_model (GELU)
     block_size: int = 128
     dropout: float = 0.10
     tie_weights: bool = True
@@ -46,11 +46,11 @@ class TrainConfig:
     resume: bool = False        # ckpt varsa optimizer+step ile devam et
 
     # ---- degerlendirme / kayit ----
-    val_frac: float = 0.1
-    eval_every: int = 50
-    eval_iters: int = 20
-    save_every: int = 100
-    log_every: int = 10
+    val_frac: float = 0.05
+    eval_every: int = 500
+    eval_iters: int = 50
+    save_every: int = 1000
+    log_every: int = 100
 
     # ---- veri akisi ----
     pack_sequences: bool = True  # ornekleri bloklara paketle (dolgusuz)
@@ -74,3 +74,8 @@ class GenerationConfig:
     typical_p: float = 0.95
     mirostat_tau: float = 5.0
     mirostat_eta: float = 0.1
+
+
+def train_config_defaults() -> dict:
+    """TrainConfig alanlarinin varsayilanlari; CLI ve pipeline tek kaynaktan beslenir."""
+    return {f.name: f.default for f in fields(TrainConfig)}

@@ -21,18 +21,15 @@ Calistirma:
   python -m src.py.normal.generate   # CLI uretim (--interactive)
 """
 
-from .config import GenerationConfig, TrainConfig
+from .config import GenerationConfig, TrainConfig, train_config_defaults
 from .corpus import (
     build_assistant_only_corpus,
     build_chatml_dataset_file,
     build_instruction_corpus,
     build_long_clean_chat_corpus,
-    build_strict_instruction_corpus,
-    build_text_sequences,
     load_chatml_dataset,
     load_jsonl_dialogues,
     make_synthetic_data,
-    make_text_data,
 )
 from .dataset import InstructionDataset
 from .generate import generate_text
@@ -61,6 +58,7 @@ from .train import (
     configure_optimizer,
     estimate_loss,
     load_checkpoint,
+    load_tokenizer_from_checkpoint,
     lr_at,
     pick_device,
     save_checkpoint,
@@ -72,6 +70,7 @@ __all__ = [
     # config
     "TrainConfig",
     "GenerationConfig",
+    "train_config_defaults",
     # tokenizer
     "BPETokenizer",
     # prompt
@@ -97,11 +96,8 @@ __all__ = [
     "build_instruction_corpus",
     "build_assistant_only_corpus",
     "build_long_clean_chat_corpus",
-    "build_strict_instruction_corpus",
     "build_chatml_dataset_file",
     "load_chatml_dataset",
-    "build_text_sequences",
-    "make_text_data",
     "make_synthetic_data",
     # dataset
     "InstructionDataset",
@@ -110,6 +106,7 @@ __all__ = [
     "pick_device",
     "save_checkpoint",
     "load_checkpoint",
+    "load_tokenizer_from_checkpoint",
     "configure_optimizer",
     "lr_at",
     "estimate_loss",

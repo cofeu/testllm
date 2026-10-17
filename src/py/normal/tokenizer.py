@@ -17,6 +17,8 @@ class BPETokenizer:
     IM_END = 5     # <|im_end|>
     OFFSET = 6
     SPECIAL_STRINGS = ["<pad>", "<bos>", "<eos>", "<unk>", "<|im_start|>", "<|im_end|>"]
+    VERSION = 2
+    PRETOKENIZATION = "prefix_space_v1"
 
     def __init__(self, vocab_size=1024, merges=None):
         self.specials = list(self.SPECIAL_STRINGS)
@@ -238,11 +240,23 @@ class BPETokenizer:
         return i < self.OFFSET
 
     def to_dict(self):
-        return {"vocab_size": self.vocab_size, "merges": [[list(a), list(b)] for a, b in self.merges]}
+        return {
+            "version": self.VERSION,
+            "pretokenization": self.PRETOKENIZATION,
+            "specials": list(self.SPECIAL_STRINGS),
+            "vocab_size": self.vocab_size,
+            "merges": [[list(a), list(b)] for a, b in self.merges],
+        }
 
     @classmethod
-    def from_dict(cls, data):
+    def from_dict(cls, data, allow_legacy: bool = False):
         payload = data or {}
+        marker = payload.get("pretokenization")
+        if marker != cls.PRETOKENIZATION and not allow_legacy:
+            raise ValueError(
+                f"tokenizer uyumsuz: pretokenization={marker!r}, beklenen {cls.PRETOKENIZATION!r}. "
+                "Once 'python -m src.py.normal.train' ile yeniden egitin."
+            )
         merges = []
         for pair in payload.get("merges", []):
             if len(pair) != 2:

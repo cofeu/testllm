@@ -86,7 +86,7 @@ def main(argv=None):
         repetition_penalty=args.repetition_penalty,
         sampler=args.sampler,
     )
-    tokenizer = _tokenizer_from_checkpoint_or(root)
+    tokenizer = _tokenizer_from_checkpoint_or(args.ckpt, root)
 
     def ask(text):
         prompt = format_chat_prompt(text, system_prompt=args.system)
@@ -108,15 +108,26 @@ def main(argv=None):
         ask(args.prompt)
 
 
-def _tokenizer_from_checkpoint_or(root):
+def _tokenizer_from_checkpoint_or(ckpt, root):
+    """Once checkpoint'e gomulu tokenizer'i, yoksa data/tokenizer.json'i dener."""
     import json
     from pathlib import Path
+
+    from .train import load_tokenizer_from_checkpoint
+
+    if ckpt and Path(ckpt).exists():
+        try:
+            tok = load_tokenizer_from_checkpoint(str(ckpt))
+        except Exception:
+            tok = None
+        if tok is not None:
+            return tok
 
     for candidate in (Path(root) / "data" / "tokenizer.json",):
         if candidate.exists():
             with open(candidate, "r", encoding="utf-8") as f:
-                return BPETokenizer.from_dict(json.load(f))
-    raise FileNotFoundError("tokenizer.json bulunamadi; once egitim calistirin")
+                return BPETokenizer.from_dict(json.load(f), allow_legacy=True)
+    raise FileNotFoundError("tokenizer bulunamadi; once egitim calistirin")
 
 
 if __name__ == "__main__":

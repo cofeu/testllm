@@ -26,7 +26,11 @@ def build_tokenizer(corpus, tok_path):
     ]
     if os.path.exists(tok_path):
         with open(tok_path, "r", encoding="utf-8") as f:
-            tokenizer = BPETokenizer.from_dict(json.load(f))
+            raw = json.load(f)
+        tokenizer = BPETokenizer.from_dict(raw, allow_legacy=True)
+        if raw.get("pretokenization") != tokenizer.PRETOKENIZATION:
+            with open(tok_path, "w", encoding="utf-8") as f:
+                json.dump(tokenizer.to_dict(), f, ensure_ascii=False)
         print(f"tokenizer yuklendi: {tok_path} (vocab={tokenizer.vocab_size})", flush=True)
     else:
         tokenizer = BPETokenizer.from_corpus(texts, vocab_size=2048)
@@ -71,7 +75,7 @@ def main():
         n_layers=8,
         n_head=8,
         n_kv_head=2,
-        ff_dim=1024,
+        ff_dim=0,
         block_size=256,
         dropout=0.1,
         tie_weights=True,
@@ -86,12 +90,6 @@ def main():
         batch_size=32,
         grad_accum=1,
         epochs=8000,
-        val_frac=0.05,
-        eval_every=500,
-        eval_iters=50,
-        save_every=1000,
-        log_every=100,
-        pack_sequences=True,
         amp=True,
         seed=7,
     )
