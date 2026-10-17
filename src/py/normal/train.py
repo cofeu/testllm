@@ -10,8 +10,8 @@ import torch
 
 from .config import TrainConfig, train_config_defaults
 from .corpus import make_synthetic_data
-from .dataset import InstructionDataset
-from .model import DecoderOnlyLM
+from .dataset import Seq2SeqDataset
+from .model import EncoderDecoderLM
 from .tokenizer import BPETokenizer
 
 
@@ -58,7 +58,7 @@ def load_checkpoint(path: str, device: torch.device | None = None):
     payload = torch.load(path, map_location=device, weights_only=True)
     known = set(TrainConfig.__dataclass_fields__)
     cfg = TrainConfig(**{k: v for k, v in payload["config"].items() if k in known})
-    model = DecoderOnlyLM(cfg).to(device)
+    model = EncoderDecoderLM(cfg).to(device)
     model.load_state_dict(payload["state_dict"])
     model.eval()
     return model, cfg
@@ -106,15 +106,23 @@ def estimate_loss(model, data, cfg, device):
     model.eval()
     losses = []
     for _ in range(cfg.eval_iters):
-        x, y = data.get_batch("val", cfg.batch_size, device)
-        if cfg.amp and device.type == "cuda":
-            with torch.amp.autocast("cuda"):
-                _, loss = model(x, y)
-        else:
-            _, loss = model(x, y)
-        losses.append(loss.item())
+        src, tgt_in, tgt_out = data.get_batch("val", cfg.batch_size, device)
+        losses.append(forward_loss(model, src, tgt_in, tgt_out, cfg, device).item())
     model.train()
     return sum(losses) / max(1, len(losses))
+
+
+def forward_loss(model, src, tgt_in, tgt_out, cfg, device):
+    """AMP'li tek ileri gecis + kayip. Pad maskeleri PAD id'sinden turetilir."""
+    pad = BPETokenizer.PAD
+    src_pad = src == pad
+    tgt_pad = tgt_in == pad
+    if cfg.amp and device.type == "cuda":
+        with torch.amp.autocast("cuda"):
+            loss = model(src, tgt_in, tgt_out, src_pad=src_pad, tgt_pad=tgt_pad)[1]
+    else:
+        loss = model(src, tgt_in, tgt_out, src_pad=src_pad, tgt_pad=tgt_pad)[1]
+    return loss
 
 
 def train_model(cfg: TrainConfig, device: torch.device | None = None, ckpt_path: str | None = None, tokenizer: BPETokenizer | None = None, texts=None):
@@ -129,7 +137,7 @@ def train_model(cfg: TrainConfig, device: torch.device | None = None, ckpt_path:
     else:
         torch.set_num_threads(max(1, os.cpu_count() or 1))
 
-    model = DecoderOnlyLM(cfg).to(device)
+    model = EncoderDecoderLM(cfg).to(device)
     optim = configure_optimizer(model, cfg)
     scaler = torch.amp.GradScaler("cuda", enabled=True) if (cfg.amp and device.type == "cuda") else None
 
@@ -159,21 +167,21 @@ def train_model(cfg: TrainConfig, device: torch.device | None = None, ckpt_path:
     if cfg.compile and hasattr(torch, "compile"):
         model = torch.compile(model)
 
-    data = InstructionDataset(tokenizer, cfg, texts) if (tokenizer is not None and texts) else None
+    data = Seq2SeqDataset(tokenizer, cfg, texts) if (tokenizer is not None and texts) else None
     if data is not None:
-        unit = "token" if data.mode == "packed" else "ornek"
-        print(f"veri: {data.n_examples} ornek ({data.mode}), train {data.n_train} {unit}, "
-              f"val {data.n_val} {unit}, vocab={cfg.vocab_size}", flush=True)
-        print(f"     learnable {data.learnable_tokens}/{data.total_tokens} token, "
-              f"doluluk ~{data.packing_ratio:.1%}", flush=True)
+        avg_src = data.total_src_tokens / max(1, data.n_examples)
+        avg_tgt = data.total_tgt_tokens / max(1, data.n_examples)
+        print(f"veri: {data.n_examples} ornek, train {data.n_train}, val {data.n_val}, "
+              f"vocab={cfg.vocab_size}", flush=True)
+        print(f"     ortalama src={avg_src:.1f} tgt={avg_tgt:.1f} token (block={cfg.block_size})", flush=True)
     base_model = getattr(model, "_orig_mod", model)
     n_params = sum(p.numel() for p in model.parameters())
     rope_state = "RoPE" if base_model.uses_rope else "learned-pos"
     if cfg.use_rope and not base_model.uses_rope:
         rope_state += " (use_rope istendi ama head_dim tek -> ogrenilmis pozisyon)"
-    ff_dim = base_model.blocks[0].mlp.hidden if base_model.blocks else cfg.ff_dim
-    print(f"model: {n_params} parametre, d_model={cfg.d_model}, layers={cfg.n_layers}, "
-          f"ff_dim={ff_dim}, pos={rope_state}", flush=True)
+    ff_dim = base_model.encoder[0].mlp.hidden if base_model.encoder else cfg.ff_dim
+    print(f"model: {n_params} parametre, d_model={cfg.d_model}, "
+          f"enc/dec layers={cfg.n_layers}/{cfg.n_layers}, ff_dim={ff_dim}, pos={rope_state}", flush=True)
 
     accum = max(1, cfg.grad_accum)
 
@@ -187,16 +195,14 @@ def train_model(cfg: TrainConfig, device: torch.device | None = None, ckpt_path:
         running = 0.0
         for _ in range(accum):
             if data is not None:
-                x, y = data.get_batch("train", cfg.batch_size, device)
+                src, tgt_in, tgt_out = data.get_batch("train", cfg.batch_size, device)
             else:
-                x, y = make_synthetic_data(cfg)
-                x, y = x.to(device), y.to(device)
+                src, tgt_in, tgt_out = make_synthetic_data(cfg)
+                src, tgt_in, tgt_out = src.to(device), tgt_in.to(device), tgt_out.to(device)
+            loss = forward_loss(model, src, tgt_in, tgt_out, cfg, device)
             if scaler is not None:
-                with torch.amp.autocast("cuda"):
-                    _, loss = model(x, y)
                 scaler.scale(loss / accum).backward()
             else:
-                _, loss = model(x, y)
                 (loss / accum).backward()
             running += loss.item()
 
@@ -265,7 +271,6 @@ def add_train_args(ap) -> None:
     ap.add_argument("--qk-norm", action="store_true", default=d["qk_norm"])
     ap.add_argument("--bias", action="store_true", default=d["bias"])
     ap.add_argument("--no-rope", action="store_true")
-    ap.add_argument("--no-pack", action="store_true")
     ap.add_argument("--no-tie", action="store_true")
     ap.add_argument("--no-amp", action="store_true")
     ap.add_argument("--no-fused", action="store_true")
@@ -320,7 +325,6 @@ def config_from_args(args, vocab_size: int) -> TrainConfig:
         eval_iters=args.eval_iters,
         save_every=args.save_every,
         log_every=args.log_every,
-        pack_sequences=not args.no_pack,
         amp=not args.no_amp,
         compile=args.compile,
         seed=args.seed,

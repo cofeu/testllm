@@ -1,17 +1,19 @@
-"""Kanonik PyTorch implementasyonu (Llama + GPT hibrit).
+"""Kanonik PyTorch implementasyonu (encoder-decoder seq2seq).
 
-Llama: RMSNorm, RoPE, GQA, SwiGLU, pre-norm. GPT: LayerNorm, GELU, ogrenilmis
-pozisyon, bias, dropout, weight tying -- `norm_type`/`activation`/`use_rope`/`bias`
-ile secilir. Modern: QK-Norm (Llama 3), RoPE scaling, z-loss, KV cache,
-gradient checkpointing, sequence packing, typical/mirostat ornekleme, resume.
+Mimari: encoder (cift yonlu self-attention) + decoder (nedensel self-attention +
+cross-attention). Llama: RMSNorm, RoPE, GQA, SwiGLU, pre-norm. GPT: LayerNorm,
+GELU, ogrenilmis pozisyon, bias, dropout, weight tying --
+`norm_type`/`activation`/`use_rope`/`bias` ile secilir. Modern: QK-Norm (Llama 3),
+RoPE scaling, z-loss, self+cross KV cache, gradient checkpointing,
+typical/mirostat ornekleme, resume.
 
 Modul yapisi:
   config     : TrainConfig, GenerationConfig
   tokenizer  : BPETokenizer
   prompt     : ChatPromptFormatter, clean_text
-  model      : DecoderOnlyLM (RMSNorm/LayerNorm, RoPE, GQA, SwiGLU/GELU, KV cache)
+  model      : EncoderDecoderLM (encoder/decoder bloklari, self+cross attention)
   corpus     : veri okuma/temizleme/korpus olusturma
-  dataset    : InstructionDataset (sequence packing)
+  dataset    : Seq2SeqDataset (kaynak/hedef ciftleri, teacher forcing)
   train      : optimizer, LR schedule, egitim, checkpoint, resume
   generate   : generate_text
 
@@ -31,12 +33,13 @@ from .corpus import (
     load_jsonl_dialogues,
     make_synthetic_data,
 )
-from .dataset import InstructionDataset
+from .dataset import Seq2SeqDataset
 from .generate import generate_text
 from .model import (
-    Block,
-    CausalSelfAttention,
-    DecoderOnlyLM,
+    Attention,
+    DecoderBlock,
+    EncoderBlock,
+    EncoderDecoderLM,
     MLP,
     RMSNorm,
     RotaryEmbedding,
@@ -57,6 +60,7 @@ from .tokenizer import BPETokenizer
 from .train import (
     configure_optimizer,
     estimate_loss,
+    forward_loss,
     load_checkpoint,
     load_tokenizer_from_checkpoint,
     lr_at,
@@ -80,11 +84,12 @@ __all__ = [
     "format_chat_prompt",
     "format_instruction_example",
     # model
-    "DecoderOnlyLM",
-    "CausalSelfAttention",
+    "EncoderDecoderLM",
+    "EncoderBlock",
+    "DecoderBlock",
+    "Attention",
     "SwiGLU",
     "MLP",
-    "Block",
     "RMSNorm",
     "RotaryEmbedding",
     "apply_rotary",
@@ -100,7 +105,7 @@ __all__ = [
     "load_chatml_dataset",
     "make_synthetic_data",
     # dataset
-    "InstructionDataset",
+    "Seq2SeqDataset",
     # train
     "seed_everything",
     "pick_device",
@@ -110,6 +115,7 @@ __all__ = [
     "configure_optimizer",
     "lr_at",
     "estimate_loss",
+    "forward_loss",
     "train_model",
     # generate
     "generate_text",

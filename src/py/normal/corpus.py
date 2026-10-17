@@ -131,7 +131,14 @@ def load_chatml_dataset(path: str):
 
 
 def make_synthetic_data(cfg: TrainConfig):
+    """Encoder-decoder icin (src, tgt_in, tgt_out) sentetik yigin uretir.
+
+    Gercek veri yoksa egitim dongusunun calismasi icin: kaynak ve hedef rastgele
+    token dizileri. tgt_in bir kaydirilmis hedeftir (teacher forcing).
+    """
     rng = np.random.default_rng(cfg.seed)
-    x = rng.integers(0, cfg.vocab_size, size=(cfg.batch_size, cfg.block_size), dtype=np.int64)
-    y = np.roll(x, -1, axis=1)
-    return torch.from_numpy(x), torch.from_numpy(y)
+    low = BPETokenizer.OFFSET
+    src = rng.integers(low, cfg.vocab_size, size=(cfg.batch_size, cfg.block_size), dtype=np.int64)
+    tgt_in = rng.integers(low, cfg.vocab_size, size=(cfg.batch_size, cfg.block_size), dtype=np.int64)
+    tgt_out = np.roll(tgt_in, -1, axis=1)
+    return torch.from_numpy(src), torch.from_numpy(tgt_in), torch.from_numpy(tgt_out)

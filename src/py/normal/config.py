@@ -12,7 +12,7 @@ class TrainConfig:
     # ---- mimari ----
     vocab_size: int = 32
     d_model: int = 128
-    n_layers: int = 8
+    n_layers: int = 8           # hem encoder hem decoder katman sayisi
     n_head: int = 8
     n_kv_head: int = 0          # 0 -> GQA yok (n_head'e esit)
     ff_dim: int = 0             # 0 -> otomatik: Llama kurali (SwiGLU) / 4*d_model (GELU)
@@ -51,9 +51,6 @@ class TrainConfig:
     eval_iters: int = 50
     save_every: int = 1000
     log_every: int = 100
-
-    # ---- veri akisi ----
-    pack_sequences: bool = True  # ornekleri bloklara paketle (dolgusuz)
 
     # ---- calisma ortami ----
     seed: int = 7

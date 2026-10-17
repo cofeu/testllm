@@ -7,7 +7,8 @@ import torch
 
 from src.py.normal import (
     BPETokenizer,
-    InstructionDataset,
+    EncoderDecoderLM,
+    Seq2SeqDataset,
     TrainConfig,
     build_assistant_only_corpus,
     load_tokenizer_from_checkpoint,
@@ -32,6 +33,7 @@ class BugfixTests(unittest.TestCase):
         self.assertEqual(d["log_every"], 100)
         self.assertEqual(d["val_frac"], 0.05)
         self.assertEqual(d["ff_dim"], 0)
+        self.assertNotIn("pack_sequences", d)
 
     def test_tokenizer_identity_enforced(self):
         raw = {"vocab_size": 300, "merges": []}
@@ -46,11 +48,10 @@ class BugfixTests(unittest.TestCase):
     def test_checkpoint_embeds_tokenizer(self):
         tok = _tok(["merhaba dunya", "bugun hava guzel"])
         cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4)
-        from src.py.normal import DecoderOnlyLM
 
         path = tempfile.mktemp(suffix=".pt")
         try:
-            save_checkpoint(DecoderOnlyLM(cfg), cfg, path, step=3, tokenizer=tok)
+            save_checkpoint(EncoderDecoderLM(cfg), cfg, path, step=3, tokenizer=tok)
             restored = load_tokenizer_from_checkpoint(path)
             self.assertIsNotNone(restored)
             self.assertEqual(restored.vocab_size, tok.vocab_size)
@@ -71,32 +72,32 @@ class BugfixTests(unittest.TestCase):
         self.assertEqual(len(corpus), 1)
         self.assertEqual(corpus[0]["user"], "normal soru")
 
-    def test_pack_flag_controls_dataset_mode(self):
+    def test_seq2seq_dataset_shapes_and_teacher_forcing(self):
         texts = _small_texts()
         tok = _tok([t["user"] for t in texts] + [t["assistant"] for t in texts])
-        base = dict(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
-                    ff_dim=0, block_size=64, dropout=0.0, batch_size=4)
+        cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
+                          ff_dim=0, block_size=64, dropout=0.0, batch_size=4)
+        ds = Seq2SeqDataset(tok, cfg, texts)
 
-        packed = InstructionDataset(tok, TrainConfig(**base, pack_sequences=True), texts)
-        per = InstructionDataset(tok, TrainConfig(**base, pack_sequences=False), texts)
+        self.assertEqual(ds.n_train + ds.n_val, ds.n_examples)
+        src, tgt_in, tgt_out = ds.get_batch("train", 4, torch.device("cpu"))
+        self.assertEqual(src.shape, (4, 64))
+        self.assertEqual(tgt_in.shape, (4, 64))
+        self.assertEqual(tgt_out.shape, (4, 64))
+        # decoder girdisi BOS ile baslar; hedefler bir kaydirilmis halidir
+        self.assertTrue(int(tgt_in[0, 0]) == tok.BOS)
+        # gercek cevap token'lari var (hepsi ignore degil)
+        self.assertGreater(int((tgt_out != ds.IGNORE).sum()), 0)
 
-        self.assertEqual(packed.mode, "packed")
-        self.assertEqual(per.mode, "per_example")
-        # per_example: her ornek ayri satir, sinir asilmaz
-        self.assertEqual(per.n_train + per.n_val, per.n_examples)
-        y = per.get_batch("train", 4, torch.device("cpu"))[1]
-        self.assertGreater(int((y != per.IGNORE).sum()), 0)
-
-    def test_z_loss_ignores_all_prompt_windows(self):
+    def test_z_loss_ignores_all_ignored_windows(self):
         tok = _tok(["merhaba dunya"])
         cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
                           ff_dim=0, block_size=8, dropout=0.0, z_loss=0.01)
-        from src.py.normal import DecoderOnlyLM
-
-        model = DecoderOnlyLM(cfg)
-        x = torch.randint(0, cfg.vocab_size, (2, 8))
-        y = torch.full((2, 8), -100)
-        _, loss = model(x, targets=y)
+        model = EncoderDecoderLM(cfg)
+        src = torch.randint(4, cfg.vocab_size, (2, 8))
+        tgt_in = torch.randint(4, cfg.vocab_size, (2, 8))
+        tgt_out = torch.full((2, 8), -100)
+        _, loss = model(src, tgt_in, targets=tgt_out)
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(float(loss), 0.0)
         loss.backward()
@@ -105,10 +106,9 @@ class BugfixTests(unittest.TestCase):
         from src.py.normal.model import default_swiglu_hidden
 
         cfg = TrainConfig(vocab_size=64, d_model=32, n_layers=1, n_head=4, ff_dim=0)
-        from src.py.normal import DecoderOnlyLM
-
-        model = DecoderOnlyLM(cfg)
-        self.assertEqual(model.blocks[0].mlp.hidden, default_swiglu_hidden(32))
+        model = EncoderDecoderLM(cfg)
+        self.assertEqual(model.encoder[0].mlp.hidden, default_swiglu_hidden(32))
+        self.assertEqual(model.decoder[0].mlp.hidden, default_swiglu_hidden(32))
 
     def test_resume_seed_offset_changes_batch_stream(self):
         from src.py.normal import seed_everything
@@ -117,7 +117,7 @@ class BugfixTests(unittest.TestCase):
         tok = _tok([t["user"] for t in texts] + [t["assistant"] for t in texts])
         cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
                           ff_dim=0, block_size=64, batch_size=4)
-        ds = InstructionDataset(tok, cfg, texts)
+        ds = Seq2SeqDataset(tok, cfg, texts)
 
         seed_everything(cfg.seed)
         a = ds.get_batch("train", 4, torch.device("cpu"))[0]

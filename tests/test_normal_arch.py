@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from src.py.normal import (
-    DecoderOnlyLM,
+    EncoderDecoderLM,
     TrainConfig,
     default_swiglu_hidden,
     make_ffn,
@@ -27,58 +27,72 @@ def _tiny(**kw):
     return TrainConfig(**base)
 
 
-def _cache_equiv(model, tokens):
-    model.eval()
+def _pair(bs=2, t=16, vocab=64):
+    return torch.randint(4, vocab, (bs, t)), torch.randint(4, vocab, (bs, t))
+
+
+def _cache_equiv(model, src, tgt):
+    """Tam decode ile self+cross cache'li kademeli decode ayni sonucu vermeli.
+
+    SDPA cekirdekleri farkli q uzunluklarinda farkli toplama sirasi kullanabildigi
+    icin float64'te karsilastirilir (sayisal gurultuyu eler)."""
+    import copy
+
+    m = copy.deepcopy(model).double().eval()
     with torch.no_grad():
-        full = model(tokens)[:, -1, :]
-        _, caches = model(tokens[:, :10], return_cache=True)
-        out, _ = model(tokens[:, 10:], caches=caches, return_cache=True, pos_offset=10)
+        full = m(src, tgt)[:, -1, :]
+        _, caches = m(src, tgt[:, :10], return_cache=True)
+        out, _ = m(src, tgt[:, 10:], caches=caches, return_cache=True, pos_offset=10)
         return (out[:, -1, :] - full).abs().max().item()
 
 
 class ArchitectureTests(unittest.TestCase):
     def setUp(self):
-        self.tokens = torch.randint(0, 64, (2, 16))
+        self.src, self.tgt = _pair()
 
     def test_llama_style_forward_and_cache(self):
-        model = DecoderOnlyLM(_tiny())
-        self.assertEqual(model(self.tokens).shape, (2, 16, 64))
-        self.assertLess(_cache_equiv(model, self.tokens), 1e-5)
+        model = EncoderDecoderLM(_tiny())
+        self.assertEqual(model(self.src, self.tgt).shape, (2, 16, 64))
+        self.assertLess(_cache_equiv(model, self.src, self.tgt), 1e-5)
 
     def test_gpt_style_layernorm_gelu_learned_pos(self):
         cfg = _tiny(norm_type="layernorm", activation="gelu", use_rope=False, bias=True)
-        model = DecoderOnlyLM(cfg)
+        model = EncoderDecoderLM(cfg)
         self.assertIsInstance(model.pos_emb, torch.nn.Embedding)
         self.assertIsNone(model.rope)
-        self.assertIsInstance(model.blocks[0].mlp, MLP)
-        self.assertEqual(model(self.tokens).shape, (2, 16, 64))
-        self.assertLess(_cache_equiv(model, self.tokens), 1e-5)
+        self.assertIsInstance(model.encoder[0].mlp, MLP)
+        self.assertIsInstance(model.decoder[0].mlp, MLP)
+        self.assertEqual(model(self.src, self.tgt).shape, (2, 16, 64))
+        self.assertLess(_cache_equiv(model, self.src, self.tgt), 1e-5)
 
     def test_qk_norm_and_cache(self):
-        model = DecoderOnlyLM(_tiny(qk_norm=True))
-        self.assertEqual(model(self.tokens).shape, (2, 16, 64))
-        self.assertLess(_cache_equiv(model, self.tokens), 1e-5)
+        model = EncoderDecoderLM(_tiny(qk_norm=True))
+        self.assertEqual(model(self.src, self.tgt).shape, (2, 16, 64))
+        self.assertLess(_cache_equiv(model, self.src, self.tgt), 1e-5)
 
     def test_linear_rope_scaling(self):
         cfg = _tiny(rope_scaling="linear", rope_scaling_factor=4.0)
-        model = DecoderOnlyLM(cfg)
+        model = EncoderDecoderLM(cfg)
         self.assertAlmostEqual(model.rope.scaling_factor, 4.0)
-        self.assertEqual(model(self.tokens).shape, (2, 16, 64))
+        self.assertEqual(model(self.src, self.tgt).shape, (2, 16, 64))
 
     def test_z_loss_backward(self):
         cfg = _tiny(z_loss=0.01)
-        model = DecoderOnlyLM(cfg)
+        model = EncoderDecoderLM(cfg)
         targets = torch.randint(0, 64, (2, 16))
-        _, loss = model(self.tokens, targets=targets)
+        _, loss = model(self.src, self.tgt, targets=targets)
         loss.backward()
         self.assertTrue(torch.isfinite(loss))
 
-    def test_gqa_and_loss_mask(self):
-        model = DecoderOnlyLM(_tiny())
+    def test_pad_masks_keep_loss_finite(self):
+        model = EncoderDecoderLM(_tiny())
+        src_pad = torch.zeros(2, 16, dtype=torch.bool)
+        src_pad[:, 12:] = True
+        tgt_pad = torch.zeros(2, 16, dtype=torch.bool)
+        tgt_pad[:, 10:] = True
         targets = torch.randint(0, 64, (2, 16))
-        mask = torch.ones(2, 16)
-        mask[:, :8] = 0.0
-        _, loss = model(self.tokens, targets=targets, loss_mask=mask)
+        targets[:, 10:] = -100
+        _, loss = model(self.src, self.tgt, targets=targets, src_pad=src_pad, tgt_pad=tgt_pad)
         self.assertTrue(torch.isfinite(loss))
 
     def test_factories(self):
@@ -95,28 +109,30 @@ class ArchitectureTests(unittest.TestCase):
 
     def test_residual_init_scaling_only_on_output_projections(self):
         cfg = _tiny(n_layers=8, d_model=64, n_head=4, ff_dim=256)
-        model = DecoderOnlyLM(cfg)
+        model = EncoderDecoderLM(cfg)
         expected = 0.02 / (2 * 8) ** 0.5
 
         def std_of(name):
             return dict(model.named_parameters())[name].std().item()
 
-        # Cikis projeksiyonlari olceklenmeli
-        self.assertAlmostEqual(std_of("blocks.0.attn.proj.weight"), expected, delta=0.0015)
-        self.assertAlmostEqual(std_of("blocks.0.mlp.down.weight"), expected, delta=0.0015)
+        # Cikis projeksiyonlari olceklenmeli (encoder self, decoder self+cross, FFN down)
+        self.assertAlmostEqual(std_of("encoder.0.attn.proj.weight"), expected, delta=0.0015)
+        self.assertAlmostEqual(std_of("decoder.0.self_attn.proj.weight"), expected, delta=0.0015)
+        self.assertAlmostEqual(std_of("decoder.0.cross_attn.proj.weight"), expected, delta=0.0015)
+        self.assertAlmostEqual(std_of("decoder.0.mlp.down.weight"), expected, delta=0.0015)
         # q/k/v projeksiyonlari OLMAMALI (0.02 kalmali)
-        self.assertAlmostEqual(std_of("blocks.0.attn.q_proj.weight"), 0.02, delta=0.002)
-        self.assertAlmostEqual(std_of("blocks.0.attn.k_proj.weight"), 0.02, delta=0.002)
-        self.assertAlmostEqual(std_of("blocks.0.attn.v_proj.weight"), 0.02, delta=0.002)
+        self.assertAlmostEqual(std_of("decoder.0.self_attn.q_proj.weight"), 0.02, delta=0.002)
+        self.assertAlmostEqual(std_of("decoder.0.self_attn.k_proj.weight"), 0.02, delta=0.002)
+        self.assertAlmostEqual(std_of("decoder.0.self_attn.v_proj.weight"), 0.02, delta=0.002)
 
     def test_mirostat_v2_truncation(self):
         logits = torch.tensor([[0.0, 0.0, 0.0, 10.0]])
         top1 = 3
         # mu buyuk -> hepsi kalir
-        probs = DecoderOnlyLM._apply_sampler(logits, None, None, None, "mirostat", None, 20.0)
+        probs = EncoderDecoderLM._apply_sampler(logits, None, None, None, "mirostat", None, 20.0)
         self.assertEqual(int((probs > 0).sum().item()), 4)
         # mu kucuk -> yalniz en olasi token
-        probs = DecoderOnlyLM._apply_sampler(logits, None, None, None, "mirostat", None, 5.0)
+        probs = EncoderDecoderLM._apply_sampler(logits, None, None, None, "mirostat", None, 5.0)
         self.assertEqual(int((probs > 0).sum().item()), 1)
         self.assertAlmostEqual(probs[0, top1].item(), 1.0, places=5)
 
@@ -148,7 +164,8 @@ class ShimTests(unittest.TestCase):
     def test_new_symbols_reexported_by_decoder_model(self):
         from src.pt import decoder_model as dm
 
-        for name in ("MLP", "make_norm", "make_ffn", "default_swiglu_hidden"):
+        for name in ("EncoderDecoderLM", "EncoderBlock", "DecoderBlock", "Attention",
+                     "MLP", "make_norm", "make_ffn", "default_swiglu_hidden"):
             self.assertTrue(hasattr(dm, name), name)
 
 

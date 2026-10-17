@@ -3,11 +3,11 @@
 import torch
 
 from .config import GenerationConfig
-from .model import DecoderOnlyLM
+from .model import EncoderDecoderLM
 from .tokenizer import BPETokenizer
 
 
-def generate_text(model: DecoderOnlyLM, tokenizer: BPETokenizer, prompt: str, generation: GenerationConfig | None = None, device: torch.device | None = None):
+def generate_text(model: EncoderDecoderLM, tokenizer: BPETokenizer, prompt: str, generation: GenerationConfig | None = None, device: torch.device | None = None):
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     generation = generation or GenerationConfig()
     prompt_text = str(prompt or "")
@@ -33,6 +33,7 @@ def generate_text(model: DecoderOnlyLM, tokenizer: BPETokenizer, prompt: str, ge
         min_p=generation.min_p,
         repetition_penalty=generation.repetition_penalty,
         device=device,
+        bos_id=tokenizer.BOS,
         eos_id=tokenizer.EOS,
         forbidden_ids={tokenizer.PAD, tokenizer.BOS, tokenizer.UNK, tokenizer.IM_START},
         stop_ids={tokenizer.IM_END},
@@ -41,9 +42,9 @@ def generate_text(model: DecoderOnlyLM, tokenizer: BPETokenizer, prompt: str, ge
         mirostat_tau=generation.mirostat_tau,
         mirostat_eta=generation.mirostat_eta,
     )
+    # Encoder-decoder'da cikti yalnizca uretilen cevaptir (prompt encoder'a gider).
     output_ids = generated[0].tolist()
-    continuation_ids = output_ids[len(prompt_ids):]
-    visible_ids = [idx for idx in continuation_ids if idx >= tokenizer.OFFSET]
+    visible_ids = [idx for idx in output_ids if idx >= tokenizer.OFFSET]
     if not visible_ids:
         return ""
 

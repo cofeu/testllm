@@ -1,9 +1,13 @@
-"""Llama + GPT tarzi decoder-only model.
+"""Encoder-Decoder (seq2seq) transformer, Llama + GPT tarzi seceneklerle.
+
+Mimari (T5/BART tarzi ama Llama bilesenleriyle):
+  encoder : cift yonlu self-attention (nedensel mask YOK) + FFN, pre-norm.
+  decoder : nedensel self-attention + cross-attention (encoder ciktisina) + FFN.
 
 Llama tarafi: RMSNorm, RoPE, GQA, SwiGLU, pre-norm, bias yok.
-GPT tarafi  : ogrenilmis pozisyon, LayerNorm, GELU FFN, dropout, weight tying --
-              hepsi `norm_type`/`activation`/`use_rope`/`bias` ile secilebilir.
-Modern      : QK-Norm (Llama 3), RoPE scaling (uzun baglam), z-loss, KV cache,
+GPT tarafi  : ogrenilmis pozisyon, LayerNorm, GELU FFN, dropout -- hepsi
+              `norm_type`/`activation`/`use_rope`/`bias` ile secilebilir.
+Modern      : QK-Norm (Llama 3), RoPE scaling, z-loss, KV cache (self + cross),
               gradient checkpointing, typical/mirostat ornekleme.
 """
 
@@ -86,11 +90,21 @@ def apply_rotary(q, k, cos, sin):
     return q, k
 
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, cfg: TrainConfig):
+class Attention(nn.Module):
+    """Cok-kafali dikkat.
+
+    * `causal=True`  -> nedensel self-attention (decoder self).
+    * `cross=True`   -> q decoder'dan, k/v encoder hafizasindan (cross-attention).
+    * `cache`        -> (k, v) tuple'i; generation'da kullanilir.
+    * `pad_mask`     -> bool [b, s], True = pad (maskelenir).
+    """
+
+    def __init__(self, cfg: TrainConfig, causal: bool = True, cross: bool = False):
         super().__init__()
         if cfg.d_model % cfg.n_head != 0:
             raise ValueError("d_model, n_head'in kati olmali")
+        self.causal = causal
+        self.cross = cross
         self.n_head = cfg.n_head
         self.n_kv_head = cfg.n_kv_head if cfg.n_kv_head else cfg.n_head
         if self.n_head % self.n_kv_head != 0:
@@ -103,47 +117,70 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
         self.attn_dropout = nn.Dropout(cfg.dropout)
         self.resid_dropout = nn.Dropout(cfg.dropout)
-
         self.qk_norm = cfg.qk_norm
         if self.qk_norm:
             self.q_norm = RMSNorm(self.head_dim)
             self.k_norm = RMSNorm(self.head_dim)
 
-    def forward(self, x, cache=None, rope=None, pos_offset: int = 0):
+    def forward(self, x, context=None, cache=None, rope=None, pos_offset: int = 0, pad_mask=None):
         b, t, c = x.shape
         q = self.q_proj(x).view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(b, t, self.n_kv_head, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(b, t, self.n_kv_head, self.head_dim).transpose(1, 2)
 
-        if self.qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-
-        if rope is not None:
-            cos, sin = rope(x, pos_offset=pos_offset)
-            q, k = apply_rotary(q, k, cos, sin)
-
-        if cache is not None:
-            past_k, past_v = cache
-            if past_k is not None and past_k.size(2) > 0:
-                k = torch.cat([past_k, k], dim=2)
-                v = torch.cat([past_v, v], dim=2)
-        new_cache = (k, v)
+        if self.cross:
+            if cache is not None:
+                k, v = cache
+                new_cache = cache
+            else:
+                s = context.size(1)
+                k = self.k_proj(context).view(b, s, self.n_kv_head, self.head_dim).transpose(1, 2)
+                v = self.v_proj(context).view(b, s, self.n_kv_head, self.head_dim).transpose(1, 2)
+                if self.qk_norm:
+                    k = self.k_norm(k)
+                new_cache = (k, v)
+            if self.qk_norm:
+                q = self.q_norm(q)
+        else:
+            k = self.k_proj(x).view(b, t, self.n_kv_head, self.head_dim).transpose(1, 2)
+            v = self.v_proj(x).view(b, t, self.n_kv_head, self.head_dim).transpose(1, 2)
+            if self.qk_norm:
+                q = self.q_norm(q)
+                k = self.k_norm(k)
+            if rope is not None:
+                cos, sin = rope(x, pos_offset=pos_offset)
+                q, k = apply_rotary(q, k, cos, sin)
+            if cache is not None:
+                past_k, past_v = cache
+                if past_k is not None and past_k.size(2) > 0:
+                    k = torch.cat([past_k, k], dim=2)
+                    v = torch.cat([past_v, v], dim=2)
+            new_cache = (k, v)
 
         if self.n_rep > 1:
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
         key_len = k.size(2)
-        offset = key_len - t
         dropout_p = self.attn_dropout.p if self.training else 0.0
-        if t > 1 and offset > 0:
-            # Cache var ve segmentte birden fazla sorgu: nedensel maskeyi mutlak
-            # konuma hizala (sorgu i, key_len-t+i dahil geriye bakabilir).
-            mask = torch.ones(t, key_len, dtype=torch.bool, device=q.device).tril(diagonal=offset)
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout_p, is_causal=False)
+        if cache is not None:
+            offset = key_len - t
+            if self.causal and t > 1 and offset > 0:
+                mask = torch.ones(t, key_len, dtype=torch.bool, device=q.device).tril(diagonal=offset)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout_p, is_causal=False)
+            else:
+                # cross-attention: maskesiz (tum kaynagi gorur). self-attention: t==1
+                # veya offset==0 ise nedensel; degilse zaten tum anahtarlar gecmis.
+                y = F.scaled_dot_product_attention(
+                    q, k, v, dropout_p=dropout_p, is_causal=(self.causal and t > 1 and offset == 0)
+                )
         else:
-            y = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, is_causal=(t > 1 and offset == 0))
+            if self.cross:
+                allowed = torch.ones(t, key_len, dtype=torch.bool, device=q.device)
+            else:
+                allowed = torch.ones(t, key_len, dtype=torch.bool, device=q.device).tril()
+            if pad_mask is not None:
+                allowed = allowed[None, None] & (~pad_mask[:, None, None, :])
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed, dropout_p=dropout_p, is_causal=False)
+
         y = y.transpose(1, 2).contiguous().view(b, t, c)
         return self.resid_dropout(self.proj(y)), new_cache
 
@@ -186,34 +223,65 @@ def make_ffn(cfg: TrainConfig) -> nn.Module:
     return SwiGLU(cfg)
 
 
-class Block(nn.Module):
+class EncoderBlock(nn.Module):
+    """Cift yonlu self-attention + FFN."""
+
     def __init__(self, cfg: TrainConfig):
         super().__init__()
         self.ln_1 = make_norm(cfg.d_model, cfg)
-        self.attn = CausalSelfAttention(cfg)
+        self.attn = Attention(cfg, causal=False)
         self.ln_2 = make_norm(cfg.d_model, cfg)
         self.mlp = make_ffn(cfg)
         self.grad_checkpointing = cfg.grad_checkpointing
 
-    def _attn_mlp(self, x, cache, rope, pos_offset):
-        attn_out, new_cache = self.attn(self.ln_1(x), cache=cache, rope=rope, pos_offset=pos_offset)
-        x = x + attn_out
-        x = x + self.mlp(self.ln_2(x))
-        return x, new_cache
+    def _fwd(self, x, rope, pad_mask):
+        x = x + self.attn(self.ln_1(x), rope=rope, pad_mask=pad_mask)[0]
+        return x + self.mlp(self.ln_2(x))
 
-    def forward(self, x, cache=None, rope=None, pos_offset: int = 0):
-        if self.grad_checkpointing and self.training and cache is None:
+    def forward(self, x, rope=None, pad_mask=None):
+        if self.grad_checkpointing and self.training:
             from torch.utils.checkpoint import checkpoint
 
-            def fn(inp):
-                out, _ = self._attn_mlp(inp, None, rope, pos_offset)
-                return out
-
-            return checkpoint(fn, x, use_reentrant=False), None
-        return self._attn_mlp(x, cache, rope, pos_offset)
+            return checkpoint(lambda inp: self._fwd(inp, rope, pad_mask), x, use_reentrant=False)
+        return self._fwd(x, rope, pad_mask)
 
 
-class DecoderOnlyLM(nn.Module):
+class DecoderBlock(nn.Module):
+    """Nedensel self-attention + cross-attention + FFN."""
+
+    def __init__(self, cfg: TrainConfig):
+        super().__init__()
+        self.ln_1 = make_norm(cfg.d_model, cfg)
+        self.self_attn = Attention(cfg, causal=True)
+        self.ln_2 = make_norm(cfg.d_model, cfg)
+        self.cross_attn = Attention(cfg, causal=False, cross=True)
+        self.ln_3 = make_norm(cfg.d_model, cfg)
+        self.mlp = make_ffn(cfg)
+        self.grad_checkpointing = cfg.grad_checkpointing
+
+    def _fwd(self, x, memory, self_cache, cross_cache, rope, pos_offset, tgt_pad, mem_pad):
+        a, sc = self.self_attn(self.ln_1(x), cache=self_cache, rope=rope, pos_offset=pos_offset, pad_mask=tgt_pad)
+        x = x + a
+        c, cc = self.cross_attn(self.ln_2(x), context=memory, cache=cross_cache, pad_mask=mem_pad)
+        x = x + c
+        x = x + self.mlp(self.ln_3(x))
+        return x, sc, cc
+
+    def forward(self, x, memory, self_cache=None, cross_cache=None, rope=None, pos_offset=0, tgt_pad=None, mem_pad=None):
+        if self.grad_checkpointing and self.training and self_cache is None:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(
+                lambda inp: self._fwd(inp, memory, None, None, rope, pos_offset, tgt_pad, mem_pad)[0],
+                x, use_reentrant=False,
+            )
+            return out, None, None
+        return self._fwd(x, memory, self_cache, cross_cache, rope, pos_offset, tgt_pad, mem_pad)
+
+
+class EncoderDecoderLM(nn.Module):
+    """Seq2seq transformer: kaynak metni kodlar, hedefi token-token uretir."""
+
     def __init__(self, cfg: TrainConfig):
         super().__init__()
         self.cfg = cfg
@@ -226,18 +294,20 @@ class DecoderOnlyLM(nn.Module):
             scaling = cfg.rope_scaling_factor if cfg.rope_scaling == "linear" else 1.0
             self.rope = RotaryEmbedding(head_dim, max_seq_len=cfg.block_size, base=cfg.rope_theta, scaling_factor=scaling)
         else:
-            # GPT tarzi ogrenilmis pozisyon gomlemesi
             self.pos_emb = nn.Embedding(cfg.block_size, cfg.d_model)
 
         self.drop = nn.Dropout(cfg.dropout)
-        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
-        self.norm = make_norm(cfg.d_model, cfg)
+        self.encoder = nn.ModuleList([EncoderBlock(cfg) for _ in range(cfg.n_layers)])
+        self.decoder = nn.ModuleList([DecoderBlock(cfg) for _ in range(cfg.n_layers)])
+        self.enc_norm = make_norm(cfg.d_model, cfg)
+        self.dec_norm = make_norm(cfg.d_model, cfg)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if cfg.tie_weights:
             self.head.weight = self.token_emb.weight
         self.apply(self._init_weights)
         for name, p in self.named_parameters():
-            if name.endswith(("attn.proj.weight", "mlp.down.weight", "mlp.proj.weight")) and p.ndim == 2:
+            if name.endswith(("attn.proj.weight", "self_attn.proj.weight", "cross_attn.proj.weight",
+                              "mlp.down.weight", "mlp.proj.weight")) and p.ndim == 2:
                 nn.init.normal_(p, mean=0.0, std=0.02 / (2 * cfg.n_layers) ** 0.5)
 
     @property
@@ -253,35 +323,50 @@ class DecoderOnlyLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def _pos(self, h, pos_offset):
+        if self.pos_emb is not None:
+            t = h.size(1)
+            pos = torch.arange(pos_offset, pos_offset + t, device=h.device).unsqueeze(0).expand(h.size(0), -1)
+            h = h + self.pos_emb(pos)
+        return h
+
+    def encode(self, src, src_pad=None):
+        h = self._pos(self.token_emb(src), 0)
+        h = self.drop(h)
+        for block in self.encoder:
+            h = block(h, rope=self.rope, pad_mask=src_pad)
+        return self.enc_norm(h)
+
     def forward(
         self,
-        x: torch.Tensor,
-        targets: torch.Tensor | None = None,
-        loss_mask: torch.Tensor | None = None,
+        src,
+        tgt,
+        targets=None,
+        src_pad=None,
+        tgt_pad=None,
         caches=None,
         return_cache: bool = False,
         pos_offset: int = 0,
     ):
-        if x.dim() != 2:
-            raise ValueError(f"x must be [batch, seq], got {tuple(x.shape)}")
-        b, t = x.shape
-        if pos_offset + t > self.cfg.block_size:
-            raise ValueError(f"sequence length {pos_offset + t} exceeds block_size {self.cfg.block_size}")
+        if src.dim() != 2 or tgt.dim() != 2:
+            raise ValueError("src ve tgt [batch, seq] olmali")
+        if pos_offset + tgt.size(1) > self.cfg.block_size:
+            raise ValueError(f"decoder uzunlugu {pos_offset + tgt.size(1)} block_size {self.cfg.block_size}'i asiyor")
 
-        h = self.token_emb(x)
-        if self.pos_emb is not None:
-            pos = torch.arange(pos_offset, pos_offset + t, device=x.device).unsqueeze(0).expand(b, -1)
-            h = h + self.pos_emb(pos)
+        memory = self.encode(src, src_pad)
+        h = self._pos(self.token_emb(tgt), pos_offset)
         h = self.drop(h)
 
         new_caches = [] if return_cache else None
-        for i, block in enumerate(self.blocks):
-            block_cache = None if caches is None else caches[i]
-            h, updated = block(h, cache=block_cache, rope=self.rope, pos_offset=pos_offset)
+        for i, block in enumerate(self.decoder):
+            self_cache = cross_cache = None
+            if caches is not None:
+                self_cache, cross_cache = caches[i]
+            h, sc, cc = block(h, memory, self_cache, cross_cache, self.rope, pos_offset, tgt_pad, src_pad)
             if return_cache:
-                new_caches.append(updated)
+                new_caches.append((sc, cc))
 
-        h = self.norm(h)
+        h = self.dec_norm(h)
         logits = self.head(h)
 
         if targets is None:
@@ -290,17 +375,11 @@ class DecoderOnlyLM(nn.Module):
         flat_logits = logits.reshape(-1, self.cfg.vocab_size)
         flat_targets = targets.reshape(-1)
         valid = flat_targets != -100
-        # reduction="none" + gecerli token sayisina bolme: pencere tamamen prompt
-        # oldugunda (tum hedefler -100) 0/0=nan olusmasini onler.
         raw = F.cross_entropy(
             flat_logits, flat_targets, reduction="none",
             ignore_index=-100, label_smoothing=self.cfg.label_smoothing,
         )
-        if loss_mask is not None:
-            flat_mask = loss_mask.reshape(-1).float() * valid.float()
-            loss = (raw * flat_mask).sum() / flat_mask.sum().clamp(min=1.0)
-        else:
-            loss = raw.sum() / valid.sum().clamp(min=1)
+        loss = raw.sum() / valid.sum().clamp(min=1)
 
         if self.cfg.z_loss > 0.0:
             log_z = torch.logsumexp(flat_logits.float(), dim=-1)
@@ -322,7 +401,7 @@ class DecoderOnlyLM(nn.Module):
             sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
             surprise = -torch.log2(sorted_probs.clamp_min(1e-12))
             keep_sorted = surprise <= mu
-            keep_sorted[..., 0] = True  # en olasi token her zaman kalir
+            keep_sorted[..., 0] = True
             keep = torch.zeros_like(probs, dtype=torch.bool)
             keep.scatter_(-1, sorted_idx, keep_sorted)
             probs = probs.masked_fill(~keep, 0.0)
@@ -368,11 +447,12 @@ class DecoderOnlyLM(nn.Module):
             min_p_value = min_p * probs.max(dim=-1, keepdim=True).values
             probs = torch.where(probs >= min_p_value, probs, torch.zeros_like(probs))
             probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+
         return probs
 
     def generate(
         self,
-        prompt: torch.Tensor,
+        src: torch.Tensor,
         max_new_tokens: int = 20,
         temperature: float = 0.7,
         top_k: int = 20,
@@ -380,6 +460,7 @@ class DecoderOnlyLM(nn.Module):
         min_p: float = 0.02,
         repetition_penalty: float = 1.2,
         device: torch.device | None = None,
+        bos_id: int = 1,
         eos_id: int = 2,
         forbidden_ids=None,
         stop_ids=None,
@@ -389,13 +470,12 @@ class DecoderOnlyLM(nn.Module):
         mirostat_tau: float = 5.0,
         mirostat_eta: float = 0.1,
     ):
-        if prompt.dim() == 1:
-            prompt = prompt.unsqueeze(0)
+        if src.dim() == 1:
+            src = src.unsqueeze(0)
 
         device = device or next(self.parameters()).device
         self.eval()
-        generated = prompt.to(device).clone()
-        prompt_len = generated.size(1)
+        src = src.to(device)
 
         if forbidden_ids is None:
             forbidden_ids = {0, 1, 3}
@@ -407,35 +487,42 @@ class DecoderOnlyLM(nn.Module):
             stop_set.update(int(i) for i in stop_ids)
         forbidden_ids -= stop_set
 
-        mu = 2.0 * mirostat_tau
-        caches = None
-        cache_len = 0
-        produced = 0
         with torch.no_grad():
+            memory = self.encode(src, None)
+
+            generated = [int(bos_id)]
+            produced = 0
+            mu = 2.0 * mirostat_tau
+            caches = None
             for _ in range(max_new_tokens):
-                if not use_cache:
-                    window = generated[:, -self.cfg.block_size:]
-                    logits = self(window)[:, -1, :]
-                elif caches is None or cache_len >= self.cfg.block_size:
-                    window = generated[:, -self.cfg.block_size:]
-                    out, caches = self(window, return_cache=True)
-                    cache_len = window.size(1)
-                    logits = out[:, -1, :]
+                if use_cache:
+                    cur = torch.tensor([[generated[-1]]], device=device, dtype=torch.long)
+                    pos = len(generated) - 1
                 else:
-                    last = generated[:, -1:]
-                    out, caches = self(last, caches=caches, return_cache=True, pos_offset=cache_len)
-                    cache_len += 1
-                    logits = out[:, -1, :]
+                    cur = torch.tensor([generated], device=device, dtype=torch.long)
+                    pos = 0
+                h = self._pos(self.token_emb(cur), pos)
+                h = self.drop(h)
+                new_caches = [] if use_cache else None
+                for i, block in enumerate(self.decoder):
+                    self_cache = cross_cache = None
+                    if use_cache and caches is not None:
+                        self_cache, cross_cache = caches[i]
+                    h, sc, cc = block(h, memory, self_cache, cross_cache, self.rope, pos, None, None)
+                    if use_cache:
+                        new_caches.append((sc, cc))
+                if use_cache:
+                    caches = new_caches
+                logits = self.head(self.dec_norm(h))[:, -1, :]
 
                 next_logits = logits / max(temperature, 1e-8)
 
-                if repetition_penalty is not None and repetition_penalty > 1.0:
-                    seen = generated[0, prompt_len:]
-                    if seen.numel() > 0:
-                        uniq = torch.unique(seen)
-                        vals = next_logits[0, uniq]
-                        vals = torch.where(vals > 0, vals / repetition_penalty, vals * repetition_penalty)
-                        next_logits[0, uniq] = vals
+                if repetition_penalty is not None and repetition_penalty > 1.0 and len(generated) > 1:
+                    seen = torch.tensor(generated[1:], device=device, dtype=torch.long)
+                    uniq = torch.unique(seen)
+                    vals = next_logits[0, uniq]
+                    vals = torch.where(vals > 0, vals / repetition_penalty, vals * repetition_penalty)
+                    next_logits[0, uniq] = vals
 
                 full_probs = None
                 if sampler == "mirostat":
@@ -466,12 +553,12 @@ class DecoderOnlyLM(nn.Module):
                         surprise = -math.log2(p_t)
                         mu -= mirostat_eta * (surprise - mirostat_tau)
 
-                generated = torch.cat([generated, next_token], dim=1)
-
+                generated.append(token_id)
                 if token_id in stop_set:
                     break
                 produced += 1
-        return generated
+
+        return torch.tensor([generated], device=device, dtype=torch.long)
 
     def generate_text(self, tokenizer, prompt: str, generation: GenerationConfig | None = None, device=None):
         from .generate import generate_text

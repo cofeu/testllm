@@ -2,7 +2,7 @@ import unittest
 
 from src.pt.decoder_model import (
     BPETokenizer,
-    DecoderOnlyLM,
+    EncoderDecoderLM,
     GenerationConfig,
     TrainConfig,
     build_assistant_only_corpus,
@@ -30,7 +30,7 @@ class GenerationPromptTests(unittest.TestCase):
             epochs=1,
             seed=7,
         )
-        model = DecoderOnlyLM(cfg)
+        model = EncoderDecoderLM(cfg)
         prompt = "Merhaba, bugün nasıl yardımcı olabilirim?"
         out = generate_text(
             model,
@@ -62,7 +62,7 @@ class GenerationPromptTests(unittest.TestCase):
             epochs=1,
             seed=7,
         )
-        model = DecoderOnlyLM(cfg)
+        model = EncoderDecoderLM(cfg)
         prompt = "Merhaba, bugün nasıl yardımcı olabilirim? Lütfen kısa ve net cevap ver."
         out = generate_text(
             model,

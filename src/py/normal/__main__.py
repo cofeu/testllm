@@ -10,7 +10,7 @@ from pathlib import Path
 from .config import GenerationConfig, TrainConfig
 from .corpus import build_assistant_only_corpus, load_jsonl_dialogues
 from .generate import generate_text
-from .model import DecoderOnlyLM
+from .model import EncoderDecoderLM
 from .prompt import DEFAULT_SYSTEM_PROMPT, format_chat_prompt
 from .tokenizer import BPETokenizer
 from .train import load_checkpoint, pick_device, train_model
@@ -109,7 +109,7 @@ def main():
     restored_model, _ = load_checkpoint(str(CKPT_PATH), device=device)
     restored = generate_text(restored_model, tokenizer, prompt, generation=generation_cfg, device=device)
     print("restored_text:", restored)
-    print("RoPE + GQA + KV cache + packing + instruction-tuned model ok")
+    print("Encoder-Decoder + RoPE + GQA + cross-attention + KV cache model ok")
 
 
 if __name__ == "__main__":
