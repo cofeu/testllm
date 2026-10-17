@@ -110,20 +110,33 @@ class ArchitectureTests(unittest.TestCase):
     def test_residual_init_scaling_only_on_output_projections(self):
         cfg = _tiny(n_layers=8, d_model=64, n_head=4, ff_dim=256)
         model = EncoderDecoderLM(cfg)
-        expected = 0.02 / (2 * 8) ** 0.5
+        # Encoder blogu 2 residual dal -> 1/sqrt(2n); decoder blogu 3 dal -> 1/sqrt(3n).
+        enc = 0.02 / (2 * 8) ** 0.5
+        dec = 0.02 / (3 * 8) ** 0.5
 
         def std_of(name):
             return dict(model.named_parameters())[name].std().item()
 
-        # Cikis projeksiyonlari olceklenmeli (encoder self, decoder self+cross, FFN down)
-        self.assertAlmostEqual(std_of("encoder.0.attn.proj.weight"), expected, delta=0.0015)
-        self.assertAlmostEqual(std_of("decoder.0.self_attn.proj.weight"), expected, delta=0.0015)
-        self.assertAlmostEqual(std_of("decoder.0.cross_attn.proj.weight"), expected, delta=0.0015)
-        self.assertAlmostEqual(std_of("decoder.0.mlp.down.weight"), expected, delta=0.0015)
+        self.assertAlmostEqual(std_of("encoder.0.attn.proj.weight"), enc, delta=0.0015)
+        self.assertAlmostEqual(std_of("encoder.0.mlp.down.weight"), enc, delta=0.0015)
+        self.assertAlmostEqual(std_of("decoder.0.self_attn.proj.weight"), dec, delta=0.0015)
+        self.assertAlmostEqual(std_of("decoder.0.cross_attn.proj.weight"), dec, delta=0.0015)
+        self.assertAlmostEqual(std_of("decoder.0.mlp.down.weight"), dec, delta=0.0015)
         # q/k/v projeksiyonlari OLMAMALI (0.02 kalmali)
         self.assertAlmostEqual(std_of("decoder.0.self_attn.q_proj.weight"), 0.02, delta=0.002)
         self.assertAlmostEqual(std_of("decoder.0.self_attn.k_proj.weight"), 0.02, delta=0.002)
         self.assertAlmostEqual(std_of("decoder.0.self_attn.v_proj.weight"), 0.02, delta=0.002)
+
+    def test_top_p_includes_boundary_token(self):
+        import math
+
+        logits = torch.tensor([[math.log(0.4), math.log(0.35), math.log(0.2), math.log(0.05)]])
+        probs = EncoderDecoderLM._apply_sampler(logits, None, 0.7, None, "top_p", None, None)
+        # 0.4 + 0.35 = 0.75 >= 0.7 -> esigi asan token dahil; 3. token (0.2) haric
+        self.assertGreater(probs[0, 0].item(), 0.0)
+        self.assertGreater(probs[0, 1].item(), 0.0)
+        self.assertEqual(probs[0, 2].item(), 0.0)
+        self.assertAlmostEqual(probs.sum().item(), 1.0, places=5)
 
     def test_mirostat_v2_truncation(self):
         logits = torch.tensor([[0.0, 0.0, 0.0, 10.0]])

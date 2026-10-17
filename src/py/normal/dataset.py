@@ -5,15 +5,23 @@ Her ornek bir (kaynak, hedef) ciftidir:
   hedef  : asistan cevabi -> decoder (teacher forcing).
 
 Decoder girdisi `<bos>` ile baslar; hedefler bir kaydirilmis halidir ve cevabin
-sonuna `<|im_end|>` (EOS) eklenir. Dolgu (pad) etiketleri -100 yapilir; boylece
-kayip yalnizca gercek cevap token'larindan hesaplanir.
+sonuna tam olarak bir `<|im_end|>` (EOS) eklenir. Dolgu (pad) etiketleri -100
+yapilir; boylece kayip yalnizca gercek cevap token'larindan hesaplanir.
 
-Encoder dolgusu self-attention'da maskelenir; encoder dolgusu decoder
-cross-attention'inda da maskelenir (model.forward'a pad maskeleri verilir).
+Bellek/hesap verimliligi:
+  * Satirlar int32 olarak duz (flat) dizilerde + ofset dizisinde saklanir
+    (int64'e gore yari bellek; blok boyutuna onceden doldurulmaz).
+  * `get_batch` yalnizca o batch'teki en uzun diziye kadar doldurur (dinamik pad),
+    boylece encoder/decoder hesaplarinin cogu dolguya gitmez.
+
+Encoder dolgusu self-attention'da; encoder dolgusu decoder cross-attention'inda;
+decoder dolgusu decoder self-attention'inda maskelenir (model.forward'a pad
+maskeleri verilir).
 """
 
 import random
 
+import numpy as np
 import torch
 
 from .config import TrainConfig
@@ -44,7 +52,8 @@ class Seq2SeqDataset:
                 # Sondaki (en guncel) baglami koru; kullanicinin sorusu prompt'un
                 # sonunda yer alir, bastan kirpmak soruyu silebilir.
                 src_ids = src_ids[-self.block_size:]
-            answer = (tokenizer.encode(assistant) + [tokenizer.IM_END])[: self.block_size - 1]
+            # Cevaplayi encoder'a koymuyoruz; IM_END'i BIR kez (tgt_out sonunda) ekle.
+            answer = tokenizer.encode(assistant)[: self.block_size - 1]
             if not src_ids or not answer:
                 continue
 
@@ -64,35 +73,64 @@ class Seq2SeqDataset:
         self.total_src_tokens = sum(len(r) for r in src_rows)
         self.total_tgt_tokens = sum(len(r) for r in out_rows)
 
-        src = self._pad(src_rows, self.tok.PAD)
-        tgt_in = self._pad(in_rows, self.tok.PAD)
-        tgt_out = self._pad(out_rows, self.IGNORE)
-
         n = self.n_examples
         cut = int(n * (1.0 - cfg.val_frac))
         cut = max(1, min(cut, n - 1)) if n > 1 else n
-        if cut < n:
-            self.train_src, self.val_src = src[:cut], src[cut:]
-            self.train_in, self.val_in = tgt_in[:cut], tgt_in[cut:]
-            self.train_out, self.val_out = tgt_out[:cut], tgt_out[cut:]
-        else:
-            self.train_src, self.val_src = src, src
-            self.train_in, self.val_in = tgt_in, tgt_in
-            self.train_out, self.val_out = tgt_out, tgt_out
-        self.n_train = self.train_src.size(0)
-        self.n_val = self.val_src.size(0)
+        train_idx = list(range(cut))
+        val_idx = list(range(cut, n)) or train_idx
 
-    def _pad(self, rows, fill):
-        if not rows:
-            rows = [[self.tok.PAD]]
-        width = self.block_size
-        padded = [(r[:width] + [fill] * (width - len(r)))[:width] for r in rows]
-        return torch.tensor(padded, dtype=torch.long)
+        self._store = {
+            "train": self._pack([src_rows[i] for i in train_idx],
+                                [in_rows[i] for i in train_idx],
+                                [out_rows[i] for i in train_idx]),
+            "val": self._pack([src_rows[i] for i in val_idx],
+                              [in_rows[i] for i in val_idx],
+                              [out_rows[i] for i in val_idx]),
+        }
+        self.n_train = len(train_idx)
+        self.n_val = len(val_idx)
+
+    @staticmethod
+    def _flat(rows):
+        rows = rows or [[]]
+        lengths = np.fromiter((len(r) for r in rows), dtype=np.int64, count=len(rows))
+        offsets = np.zeros(len(rows) + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(lengths)
+        data = np.empty(int(offsets[-1]), dtype=np.int32)
+        for i, r in enumerate(rows):
+            if r:
+                data[offsets[i]:offsets[i + 1]] = r
+        return data, offsets
+
+    def _pack(self, src_rows, in_rows, out_rows):
+        return {
+            "src": self._flat(src_rows),
+            "in": self._flat(in_rows),
+            "out": self._flat(out_rows),
+        }
+
+    @staticmethod
+    def _batch(store, ix, fill):
+        data, offsets = store
+        starts = offsets[ix]
+        ends = offsets[ix + 1]
+        max_len = max(1, int((ends - starts).max()))
+        out = np.full((len(ix), max_len), fill, dtype=np.int64)
+        for j in range(len(ix)):
+            s, e = int(starts[j]), int(ends[j])
+            if e > s:
+                out[j, : e - s] = data[s:e]
+        return out
 
     def get_batch(self, split, batch_size, device):
-        if split == "train":
-            src, tgt_in, tgt_out = self.train_src, self.train_in, self.train_out
-        else:
-            src, tgt_in, tgt_out = self.val_src, self.val_in, self.val_out
-        ix = torch.randint(0, max(1, src.size(0)), (batch_size,))
-        return src[ix].to(device), tgt_in[ix].to(device), tgt_out[ix].to(device)
+        store = self._store["train" if split == "train" else "val"]
+        n = store["src"][1].size - 1
+        ix = np.random.randint(0, max(1, n), size=batch_size)
+        src = self._batch(store["src"], ix, self.tok.PAD)
+        tgt_in = self._batch(store["in"], ix, self.tok.PAD)
+        tgt_out = self._batch(store["out"], ix, self.IGNORE)
+        return (
+            torch.from_numpy(src).long().to(device),
+            torch.from_numpy(tgt_in).long().to(device),
+            torch.from_numpy(tgt_out).long().to(device),
+        )

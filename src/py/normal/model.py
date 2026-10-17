@@ -163,7 +163,11 @@ class Attention(nn.Module):
         dropout_p = self.attn_dropout.p if self.training else 0.0
         if cache is not None:
             offset = key_len - t
-            if self.causal and t > 1 and offset > 0:
+            if self.cross and pad_mask is not None:
+                # Cross-attention cache'li dahi olsa encoder dolgusunu maskele.
+                allowed = (~pad_mask[:, None, None, :]).expand(-1, 1, t, key_len)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed, dropout_p=dropout_p, is_causal=False)
+            elif self.causal and t > 1 and offset > 0:
                 mask = torch.ones(t, key_len, dtype=torch.bool, device=q.device).tril(diagonal=offset)
                 y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout_p, is_causal=False)
             else:
@@ -305,10 +309,19 @@ class EncoderDecoderLM(nn.Module):
         if cfg.tie_weights:
             self.head.weight = self.token_emb.weight
         self.apply(self._init_weights)
+        # Residual olcek: her residual dal icin 1/sqrt(2*n) (GPT kurali). Encoder
+        # blogunda 2 dal (self + FFN), decoder blogunda 3 dal (self + cross + FFN).
+        enc_std = 0.02 / (2 * cfg.n_layers) ** 0.5
+        dec_std = 0.02 / (3 * cfg.n_layers) ** 0.5
         for name, p in self.named_parameters():
-            if name.endswith(("attn.proj.weight", "self_attn.proj.weight", "cross_attn.proj.weight",
-                              "mlp.down.weight", "mlp.proj.weight")) and p.ndim == 2:
-                nn.init.normal_(p, mean=0.0, std=0.02 / (2 * cfg.n_layers) ** 0.5)
+            if p.ndim != 2:
+                continue
+            if name.startswith("encoder.") and name.endswith(("attn.proj.weight", "mlp.down.weight", "mlp.proj.weight")):
+                nn.init.normal_(p, mean=0.0, std=enc_std)
+            elif name.startswith("decoder.") and name.endswith(
+                ("self_attn.proj.weight", "cross_attn.proj.weight", "mlp.down.weight", "mlp.proj.weight")
+            ):
+                nn.init.normal_(p, mean=0.0, std=dec_std)
 
     @property
     def uses_rope(self) -> bool:
@@ -435,13 +448,15 @@ class EncoderDecoderLM(nn.Module):
         elif top_p is not None and 0.0 < top_p < 1.0:
             sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
             cumulative = torch.cumsum(sorted_probs, dim=-1)
-            mask = cumulative <= top_p
-            if mask.any(dim=-1, keepdim=True).item() == 0:
-                mask[..., 0] = True
+            # Esigi asan token'i DAHIL et: kumulatif > top_p olanlari cikar, sonra
+            # bir kaydir (ilk esigi asan token kalir). Ilk token her zaman kalir.
+            remove = cumulative > top_p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
             keep = torch.zeros_like(probs, dtype=torch.bool)
-            keep.scatter_(1, sorted_indices, mask)
+            keep.scatter_(1, sorted_indices, ~remove)
             probs = probs.masked_fill(~keep, 0.0)
-            probs = probs / probs.sum(dim=-1, keepdim=True)
+            probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
 
         if min_p is not None and min_p > 0.0:
             min_p_value = min_p * probs.max(dim=-1, keepdim=True).values
@@ -477,6 +492,10 @@ class EncoderDecoderLM(nn.Module):
         self.eval()
         src = src.to(device)
 
+        # Decoder toplam uzunlugu block_size'i asmasin (pos_emb tasmasi / egitimde
+        # gorulmemis pozisyonlari onle). BOS + max_new_tokens <= block_size.
+        max_new_tokens = max(0, min(int(max_new_tokens), self.cfg.block_size - 1))
+
         if forbidden_ids is None:
             forbidden_ids = {0, 1, 3}
         forbidden_ids = {int(i) for i in forbidden_ids}
@@ -487,8 +506,12 @@ class EncoderDecoderLM(nn.Module):
             stop_set.update(int(i) for i in stop_ids)
         forbidden_ids -= stop_set
 
+        src_pad = src == 0
+        if not bool(src_pad.any()):
+            src_pad = None
+
         with torch.no_grad():
-            memory = self.encode(src, None)
+            memory = self.encode(src, src_pad)
 
             generated = [int(bos_id)]
             produced = 0
@@ -508,7 +531,7 @@ class EncoderDecoderLM(nn.Module):
                     self_cache = cross_cache = None
                     if use_cache and caches is not None:
                         self_cache, cross_cache = caches[i]
-                    h, sc, cc = block(h, memory, self_cache, cross_cache, self.rope, pos, None, None)
+                    h, sc, cc = block(h, memory, self_cache, cross_cache, self.rope, pos, None, src_pad)
                     if use_cache:
                         new_caches.append((sc, cc))
                 if use_cache:

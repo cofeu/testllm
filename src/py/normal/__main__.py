@@ -24,16 +24,19 @@ def build_tokenizer(corpus, tok_path):
     texts = [item["user"] for item in corpus if isinstance(item, dict)] + [
         item["assistant"] for item in corpus if isinstance(item, dict)
     ]
+    raw = None
     if os.path.exists(tok_path):
         with open(tok_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        tokenizer = BPETokenizer.from_dict(raw, allow_legacy=True)
-        if raw.get("pretokenization") != tokenizer.PRETOKENIZATION:
-            with open(tok_path, "w", encoding="utf-8") as f:
-                json.dump(tokenizer.to_dict(), f, ensure_ascii=False)
+    if raw is not None and raw.get("pretokenization") == BPETokenizer.PRETOKENIZATION:
+        tokenizer = BPETokenizer.from_dict(raw)
         print(f"tokenizer yuklendi: {tok_path} (vocab={tokenizer.vocab_size})", flush=True)
     else:
-        tokenizer = BPETokenizer.from_corpus(texts, vocab_size=2048)
+        # Eski/uyumsuz tokenizer'i damgalamak yerine yeniden egit (merge semasi farkli olabilir).
+        if raw is not None:
+            print("tokenizer uyumsuz sema (pretokenization); yeniden egitiliyor...", flush=True)
+        vocab = int(raw.get("vocab_size", 2048)) if raw else 2048
+        tokenizer = BPETokenizer.from_corpus(texts, vocab_size=vocab)
         with open(tok_path, "w", encoding="utf-8") as f:
             json.dump(tokenizer.to_dict(), f, ensure_ascii=False)
         print(f"tokenizer egitildi ve kaydedildi: {tok_path} (vocab={tokenizer.vocab_size})", flush=True)

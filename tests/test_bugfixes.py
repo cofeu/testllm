@@ -81,13 +81,31 @@ class BugfixTests(unittest.TestCase):
 
         self.assertEqual(ds.n_train + ds.n_val, ds.n_examples)
         src, tgt_in, tgt_out = ds.get_batch("train", 4, torch.device("cpu"))
-        self.assertEqual(src.shape, (4, 64))
-        self.assertEqual(tgt_in.shape, (4, 64))
-        self.assertEqual(tgt_out.shape, (4, 64))
-        # decoder girdisi BOS ile baslar; hedefler bir kaydirilmis halidir
-        self.assertTrue(int(tgt_in[0, 0]) == tok.BOS)
-        # gercek cevap token'lari var (hepsi ignore degil)
+        # Dinamik pad: batch'teki en uzun diziye kadar (block_size'i asmaz)
+        self.assertEqual(src.size(0), 4)
+        self.assertLessEqual(src.size(1), cfg.block_size)
+        self.assertEqual(tgt_in.shape, tgt_out.shape)
+        self.assertLessEqual(tgt_in.size(1), cfg.block_size)
+        # decoder girdisi BOS ile baslar; gercek cevap token'lari var
+        self.assertEqual(int(tgt_in[0, 0]), tok.BOS)
         self.assertGreater(int((tgt_out != ds.IGNORE).sum()), 0)
+
+    def test_teacher_forcing_alignment_and_single_eos(self):
+        texts = _small_texts(20)
+        tok = _tok([t["user"] for t in texts] + [t["assistant"] for t in texts])
+        cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
+                          ff_dim=0, block_size=64, dropout=0.0, batch_size=4)
+        ds = Seq2SeqDataset(tok, cfg, texts)
+        _, tgt_in, tgt_out = ds.get_batch("train", 4, torch.device("cpu"))
+        for r in range(4):
+            row_in = tgt_in[r][tgt_in[r] != tok.PAD]
+            row_out = tgt_out[r][tgt_out[r] != ds.IGNORE]
+            self.assertEqual(int(row_in[0]), tok.BOS)
+            self.assertEqual(int(row_out[-1]), tok.IM_END)
+            # tgt_in = [BOS] + answer ; tgt_out = answer + [IM_END]
+            self.assertTrue(torch.equal(row_in[1:], row_out[:-1]))
+            # IM_END tam olarak BIR kez (cift EOS yok)
+            self.assertEqual(int((row_out == tok.IM_END).sum()), 1)
 
     def test_z_loss_ignores_all_ignored_windows(self):
         tok = _tok(["merhaba dunya"])

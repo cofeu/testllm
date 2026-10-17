@@ -129,8 +129,9 @@ tarzı bileşenler yapılandırma ile açılır:
 | Ortak bileşenler | pre-norm, dropout, weight tying, GQA, self+cross KV cache | |
 
 - **Teacher forcing**: decoder girdisi `<bos>` ile başlar, hedefler bir
-  kaydırılmış hâlidir; cevabın sonuna `<|im_end|>` (EOS) eklenir. Pad etiketleri
-  `-100` olduğu için kayıp yalnızca gerçek cevap token'larından hesaplanır.
+  kaydırılmış hâlidir; cevabın sonuna tam olarak bir `<|im_end|>` (EOS) eklenir.
+  Pad etiketleri `-100` olduğu için kayıp yalnızca gerçek cevap token'larından
+  hesaplanır.
 - **Pad maskeleri**: encoder dolgusu hem encoder self-attention'ında hem decoder
   cross-attention'ında maskelenir; decoder dolgusu self-attention'ında maskelenir.
   Boyut `F.scaled_dot_product_attention`'ın bool `attn_mask`'i ile verilir.
@@ -146,15 +147,21 @@ tarzı bileşenler yapılandırma ile açılır:
   üretim deterministik seed altında aynı sonucu verir.
 - **SwiGLU / GELU FFN**: `activation` ile seçilir; `default_swiglu_hidden(d_model)`
   Llama kuralıyla (~8/3·d_model, 64'ün katı) gizli boyutu verir.
-- **Residual başlatma ölçekleme** yalnızca çıkış projeksiyonlarına
-  (`attn.proj`, `self_attn.proj`, `cross_attn.proj`, `mlp.down`/`mlp.proj`)
-  uygulanır; q/k/v projeksiyonları standart 0.02 ile başlar.
+- **Residual başlatma ölçekleme** yalnızca çıkış projeksiyonlarına uygulanır;
+  her residual dal için `1/√(2·n)` GPT kuralıyla: encoder bloğu 2 dal
+  (`attn.proj`, `mlp.down`/`mlp.proj`), decoder bloğu 3 dal (`self_attn.proj`,
+  `cross_attn.proj`, `mlp.down`/`mlp.proj`). q/k/v projeksiyonları standart 0.02
+  ile başlar.
 - **QK-Norm** (`qk_norm=True`): Llama 3 stabilitiesi için q/k üzerine RMSNorm.
 - **z-loss** (`z_loss>0`): logit büyüklüğünü düzenleyen ek kayıp terimi; yalnızca
   `-100` olmayan (gerçek hedef) konumlarda hesaplanır.
 - **Prefix-space tokenizer** (GPT-2 tarzı): kelimeye başındaki boşluk dahil
   edilir; tek başına boşluk tokeni ~%0,3'e iner ve aynı bağlama ~%27 daha fazla
   metin sığar (token/kelime 3,13 → 2,32).
+- **Dinamik pad + int32 depolama**: `Seq2SeqDataset` satırları int32 düz
+  dizilerde saklar (int64'e göre yarı bellek; blok boyutuna önceden doldurulmaz)
+  ve `get_batch` yalnızca o batch'teki **en uzun** diziye kadar doldurur — böylece
+  encoder/decoder hesaplarının çoğu dolguya gitmez.
 - **Kaynak kırpma**: prompt blok boyutunu aşarsa **sondaki** (en güncel) bağlam
   korunur, böylece kullanıcının sorusu prompt sonunda olduğu için silinmez.
 - **Tek system prompt kaynağı**: `prompt.DEFAULT_SYSTEM_PROMPT` (kısa); eğitim,
@@ -166,9 +173,11 @@ tarzı bileşenler yapılandırma ile açılır:
   ağırlık grubu ayrımı ve cosine + warmup LR zamanlaması.
 - **Resume**: checkpoint optimizer + scaler + step durumunu saklar; `--resume` /
   `TrainConfig(resume=True)` ile kaldığı adımdan devam eder.
-- **Örnekleme**: `sampler="top_p"` (varsayılan), `"typical"` veya `"mirostat"`
-  (v2: `surprise > μ` olan token'lar elenir, sonra `μ -= η·(gözlenen surprise − τ)`);
-  ayrıca `top_k`, `top_p`, `min_p`, `repetition_penalty`.
+- **Örnekleme**: `sampler="top_p"` (varsayılan; eşiği aşan token **dahil**),
+  `"typical"` veya `"mirostat"` (v2: `surprise > μ` olan token'lar elenir, sonra
+  `μ -= η·(gözlenen surprise − τ)`); ayrıca `top_k`, `top_p`, `min_p`,
+  `repetition_penalty`. `generate()` çıktıyı `block_size − 1` token ile sınırlar
+  (pozisyon taşmasını önler).
 - **Özel token'lar**: `<pad>`=0, `<bos>`=1, `<eos>`=2, `<unk>`=3,
   `<|im_start|>`=4, `<|im_end|>`=5, bayt aralığı 6'dan başlar (`OFFSET=6`).
 

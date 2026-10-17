@@ -349,20 +349,21 @@ def main(argv=None):
     print(f"korpus: {len(corpus)} ornek", flush=True)
 
     texts = [c["user"] for c in corpus] + [c["assistant"] for c in corpus]
-    if os.path.exists(args.tokenizer):
-        with open(args.tokenizer, "r", encoding="utf-8") as f:
-            tokenizer = BPETokenizer.from_dict(json.load(f), allow_legacy=True)
-    else:
-        tokenizer = BPETokenizer.from_corpus(texts, vocab_size=2048)
-        with open(args.tokenizer, "w", encoding="utf-8") as f:
-            json.dump(tokenizer.to_dict(), f, ensure_ascii=False)
-    # Eski (kimliksiz) dosyayi yeni kimlikle tazele.
+    raw = None
     if os.path.exists(args.tokenizer):
         with open(args.tokenizer, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        if raw.get("pretokenization") != tokenizer.PRETOKENIZATION:
-            with open(args.tokenizer, "w", encoding="utf-8") as f:
-                json.dump(tokenizer.to_dict(), f, ensure_ascii=False)
+    if raw is not None and raw.get("pretokenization") == BPETokenizer.PRETOKENIZATION:
+        tokenizer = BPETokenizer.from_dict(raw)
+    else:
+        # Eski (kimliksiz/uyumsuz) dosyayi damgalamak yerine yeniden egit: merge'ler
+        # yeni semayla ogrenilmemis olabilir, aksi halde surum kontrolu anlamsizlasir.
+        if raw is not None:
+            print("tokenizer uyumsuz sema (pretokenization); yeniden egitiliyor...", flush=True)
+        vocab = int(raw.get("vocab_size", 2048)) if raw else 2048
+        tokenizer = BPETokenizer.from_corpus(texts, vocab_size=vocab)
+        with open(args.tokenizer, "w", encoding="utf-8") as f:
+            json.dump(tokenizer.to_dict(), f, ensure_ascii=False)
 
     cfg = config_from_args(args, tokenizer.vocab_size)
     device = pick_device() if args.device is None else torch.device(args.device)
