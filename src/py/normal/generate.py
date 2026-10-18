@@ -59,16 +59,16 @@ def main(argv=None):
     import argparse
     from pathlib import Path
 
-    from .prompt import format_chat_prompt, system_prompt_for
-    from .train import load_checkpoint, pick_device
+    from .prompt import DEFAULT_SYSTEM_PROMPT, SYSTEM_PROMPTS, format_chat_prompt, system_prompt_for
+    from .train import load_checkpoint, load_checkpoint_metadata, pick_device
 
     root = Path(__file__).resolve().parents[3]
     ap = argparse.ArgumentParser(description="Modelden metin uret")
     ap.add_argument("--ckpt", default=str(root / "decoder_model_ckpt.pt"))
     ap.add_argument("--prompt", default="Merhaba, bugün nasıl yardımcı olabilirim?")
-    ap.add_argument("--system", default=None, help="ozel sistem prompt'u (verilirse --mode'u ezer)")
-    ap.add_argument("--mode", choices=["default", "safe", "open", "reasoning"], default="default",
-                    help="hazir sistem-prompt modu: safe=censored, open=uncensored")
+    ap.add_argument("--system", default=None, help="ozel sistem prompt'u (verilirse --mode ve checkpoint varsayilanini ezer)")
+    ap.add_argument("--mode", choices=sorted(SYSTEM_PROMPTS), default=None,
+                    help="hazir sistem-prompt modu: safe=censored, open=uncensored (varsayilan: checkpoint'te kayitli mod)")
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top-k", type=int, default=40)
@@ -79,10 +79,25 @@ def main(argv=None):
     ap.add_argument("--device", default=None)
     ap.add_argument("--interactive", action="store_true")
     args = ap.parse_args(argv)
-    system_prompt = args.system if args.system is not None else system_prompt_for(args.mode)
 
     device = pick_device() if args.device is None else torch.device(args.device)
     model, _ = load_checkpoint(args.ckpt, device=device)
+
+    # Sistem-prompt onceligi: --system > --mode > checkpoint'te kayitli > default.
+    ckpt_meta = {}
+    if Path(args.ckpt).exists():
+        try:
+            ckpt_meta = load_checkpoint_metadata(str(args.ckpt))
+        except Exception:
+            ckpt_meta = {}
+    if args.system is not None:
+        system_prompt = args.system
+    elif args.mode is not None:
+        system_prompt = system_prompt_for(args.mode)
+    else:
+        system_prompt = ckpt_meta.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+        if ckpt_meta.get("system_prompt"):
+            print(f"(checkpoint sistem-modu: {ckpt_meta.get('system_mode') or 'ozel'})")
     gen = GenerationConfig(
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,

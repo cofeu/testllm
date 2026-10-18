@@ -18,7 +18,7 @@ Modul yapisi:
   generate   : generate_text
 
 Calistirma:
-  python -m src.py.normal            # tam pipeline (egit + uret)
+  python -m src.py.normal            # egitim CLI'sine delege (train.main)
   python -m src.py.normal.train      # CLI egitim (--resume vb.)
   python -m src.py.normal.generate   # CLI uretim (--interactive)
 """
@@ -61,6 +61,7 @@ from .prompt import (
     clean_text,
     format_chat_prompt,
     format_instruction_example,
+    strip_special_tokens,
     system_prompt_for,
 )
 from .tokenizer import BPETokenizer
@@ -69,6 +70,7 @@ from .train import (
     estimate_loss,
     forward_loss,
     load_checkpoint,
+    load_checkpoint_metadata,
     load_tokenizer_from_checkpoint,
     lr_at,
     pick_device,
@@ -95,6 +97,7 @@ __all__ = [
     "clean_text",
     "format_chat_prompt",
     "format_instruction_example",
+    "strip_special_tokens",
     # model
     "EncoderDecoderLM",
     "EncoderBlock",
@@ -126,6 +129,7 @@ __all__ = [
     "save_checkpoint",
     "load_checkpoint",
     "load_tokenizer_from_checkpoint",
+    "load_checkpoint_metadata",
     "configure_optimizer",
     "lr_at",
     "estimate_loss",

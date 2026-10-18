@@ -18,7 +18,9 @@ class BPETokenizer:
     OFFSET = 6
     SPECIAL_STRINGS = ["<pad>", "<bos>", "<eos>", "<unk>", "<|im_start|>", "<|im_end|>"]
     VERSION = 2
-    PRETOKENIZATION = "prefix_space_v1"
+    # v2: satir sonu (\n) iceren veriyle yeniden egitilmis merge'ler; boylece
+    # "\n\n" tek token olabilir. Eski v1 dosyalari uyumsuz sayilip yeniden egitilir.
+    PRETOKENIZATION = "prefix_space_v2"
 
     def __init__(self, vocab_size=1024, merges=None):
         self.specials = list(self.SPECIAL_STRINGS)

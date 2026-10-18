@@ -192,3 +192,25 @@ class Seq2SeqDataset:
             torch.from_numpy(tgt_in).long().to(device),
             torch.from_numpy(tgt_out).long().to(device),
         )
+
+    def eval_batches(self, split, batch_size, device):
+        """Deterministik degerlendirme: tum split'i kovalara gore sirayla, bir kez dolasir.
+
+        `get_batch`'in aksine ornekleme yapmaz; ayni veri uzerinde tekrarlanabilir
+        sonuc verir ve her ornegi tam olarak bir kez gorur.
+        """
+        key = "train" if split == "train" else "val"
+        store = self._store[key]
+        bs = max(1, int(batch_size))
+        for bucket in self._buckets[key]:
+            for start in range(0, int(bucket.size), bs):
+                ix = bucket[start:start + bs]
+                src = self._batch(store["src"], ix, self.tok.PAD)
+                tgt_in = self._batch(store["in"], ix, self.tok.PAD)
+                tgt_out = self._batch(store["out"], ix, self.IGNORE)
+                yield (
+                    torch.from_numpy(src).long().to(device),
+                    torch.from_numpy(tgt_in).long().to(device),
+                    torch.from_numpy(tgt_out).long().to(device),
+                )
+

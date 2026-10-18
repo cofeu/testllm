@@ -2,6 +2,8 @@
 
 import re
 
+from .tokenizer import BPETokenizer
+
 DEFAULT_SYSTEM_PROMPT = "Sen kısa, doğal ve yardımcı Türkçe cevaplar veren bir asistansın."
 REASONING_SYSTEM_PROMPT = (
     "Sen Türkçe düşünen bir asistansın. Zor sorularda önce adım adım düşünür, "
@@ -30,10 +32,34 @@ SYSTEM_PROMPTS = {
 
 
 def system_prompt_for(mode: str | None) -> str:
-    """Isimle ('safe'/'open'/'reasoning'/'default') veya dogrudan metinle prompt sec."""
-    if not mode:
+    """Isimle ('safe'/'open'/'reasoning'/'default') prompt sec.
+
+    Bilinmeyen mod sessizce metin sayilmaz; acik hata verilir.
+    """
+    if mode is None or not str(mode).strip():
         return DEFAULT_SYSTEM_PROMPT
-    return SYSTEM_PROMPTS.get(str(mode).strip().lower(), str(mode))
+    key = str(mode).strip().lower()
+    if key not in SYSTEM_PROMPTS:
+        raise ValueError(
+            f"Bilinmeyen mod: {mode!r}. Gecerli modlar: {sorted(SYSTEM_PROMPTS)}"
+        )
+    return SYSTEM_PROMPTS[key]
+
+
+_SPECIAL_PATTERN = re.compile(
+    "|".join(re.escape(s) for s in sorted(BPETokenizer.SPECIAL_STRINGS, key=len, reverse=True))
+)
+
+
+def strip_special_tokens(text: str) -> str:
+    """Kullanici/gecmis metninden ozel chat token kalıplarini temizle.
+
+    Boylece cikarimda `<|im_start|>system...` enjeksiyonu imkansiz olur; tokenizer
+    `encode` bu kalıpları ozel token'a ceviremez.
+    """
+    if not text:
+        return ""
+    return _SPECIAL_PATTERN.sub("", text)
 
 
 def clean_text(value, keep_newlines: bool = False):
@@ -53,7 +79,9 @@ def clean_text(value, keep_newlines: bool = False):
 
 class ChatPromptFormatter:
     def __init__(self, system_prompt: str | None = None):
-        self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
+        self.system_prompt = strip_special_tokens(
+            clean_text(system_prompt, keep_newlines=True)
+        ) or DEFAULT_SYSTEM_PROMPT
 
     def format_messages(self, messages):
         if not messages:
@@ -62,7 +90,8 @@ class ChatPromptFormatter:
         blocks = [f"<|im_start|>system\n{self.system_prompt}\n<|im_end|>"]
         for msg in messages:
             role = str(msg.get("role", "user")).strip().lower()
-            content = clean_text(str(msg.get("content", "")), keep_newlines=True)
+            raw = clean_text(str(msg.get("content", "")), keep_newlines=True)
+            content = strip_special_tokens(raw)
             if not content:
                 continue
             if role not in {"user", "assistant"}:

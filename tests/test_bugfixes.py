@@ -307,6 +307,67 @@ class BugfixTests(unittest.TestCase):
             m2 = model.encode(src2)
         self.assertFalse(torch.allclose(m1[0, 0], m2[0, 0], atol=1e-6))
 
+    def test_checkpoint_stores_system_prompt_and_meta(self):
+        from src.py.normal import load_checkpoint_metadata
+
+        tok = _tok(["merhaba dunya"])
+        cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4)
+        path = tempfile.mktemp(suffix=".pt")
+        try:
+            save_checkpoint(EncoderDecoderLM(cfg), cfg, path, step=1, tokenizer=tok,
+                            system_prompt="SYS", system_mode="safe",
+                            meta={"data_files": ["a.jsonl"]})
+            meta = load_checkpoint_metadata(path)
+            self.assertEqual(meta["system_prompt"], "SYS")
+            self.assertEqual(meta["system_mode"], "safe")
+            self.assertEqual(meta["meta"]["data_files"], ["a.jsonl"])
+            self.assertEqual(meta["tokenizer_summary"]["vocab_size"], tok.vocab_size)
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_eval_batches_full_and_deterministic(self):
+        texts = _small_texts(60)
+        tok = _tok([t["user"] for t in texts] + [t["assistant"] for t in texts])
+        cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
+                          ff_dim=0, block_size=64, batch_size=8, val_frac=0.25)
+        ds = Seq2SeqDataset(tok, cfg, texts)
+        first = list(ds.eval_batches("val", 8, torch.device("cpu")))
+        second = list(ds.eval_batches("val", 8, torch.device("cpu")))
+        self.assertEqual(sum(t[0].size(0) for t in first), ds.n_val)
+        self.assertEqual(len(first), len(second))
+        self.assertTrue(torch.equal(first[0][0], second[0][0]))
+
+    def test_turkish_lowercase_dedup(self):
+        from src.py.normal.corpus import tr_lower
+
+        self.assertEqual(tr_lower("ILIK"), "ılık")
+        self.assertEqual(tr_lower("İstanbul"), "istanbul")
+        # Default .lower() hatasi: I->i; tr_lower dogru esleme yapar.
+        self.assertNotEqual(tr_lower("ILIK"), "ILIK".lower())
+
+    def test_tokenizer_learns_double_newline(self):
+        from src.py.normal.tokenizer import BPETokenizer as T
+
+        texts = [("a\n\nb\n\n" + "x y " * 20) for _ in range(200)]
+        tok = T.from_corpus(texts, vocab_size=300)
+        # Satir sonu iceren veriyle egitilince "\n\n" tek token'a birlesir.
+        self.assertEqual(len(tok.encode("\n\n")), 1)
+
+    def test_estimate_loss_token_weighted_deterministic(self):
+        from src.py.normal.train import estimate_loss
+
+        texts = _small_texts(40)
+        tok = _tok([t["user"] for t in texts] + [t["assistant"] for t in texts])
+        cfg = TrainConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=1, n_head=4,
+                          ff_dim=0, block_size=64, batch_size=4, val_frac=0.25, dropout=0.0)
+        ds = Seq2SeqDataset(tok, cfg, texts)
+        model = EncoderDecoderLM(cfg).eval()
+        a = estimate_loss(model, ds, cfg, torch.device("cpu"))
+        b = estimate_loss(model, ds, cfg, torch.device("cpu"))
+        self.assertAlmostEqual(a, b, places=6)
+        self.assertTrue(0.0 < a < 100.0)
+
     def test_decoder_self_attention_causal(self):
         # Decoder nedensel kalmali: hedefin SON token'i degisince ILK konumun
         # logit'i degismemeli.

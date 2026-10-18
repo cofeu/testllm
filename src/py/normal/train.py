@@ -12,6 +12,7 @@ from .config import TrainConfig, train_config_defaults
 from .corpus import make_synthetic_data
 from .dataset import Seq2SeqDataset
 from .model import EncoderDecoderLM
+from .prompt import SYSTEM_PROMPTS
 from .tokenizer import BPETokenizer
 
 
@@ -29,6 +30,20 @@ def pick_device(prefer_gpu: bool = True) -> torch.device:
     return torch.device("cpu")
 
 
+def _git_commit() -> str | None:
+    """Depo commit hash'i (yoksa None)."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() or None if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
 def save_checkpoint(
     model: torch.nn.Module,
     cfg: TrainConfig,
@@ -37,6 +52,9 @@ def save_checkpoint(
     step: int | None = None,
     scaler=None,
     tokenizer: BPETokenizer | None = None,
+    system_prompt: str | None = None,
+    system_mode: str | None = None,
+    meta: dict | None = None,
 ):
     save_path = Path(path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,8 +66,23 @@ def save_checkpoint(
         payload["scaler"] = scaler.state_dict()
     if tokenizer is not None:
         payload["tokenizer"] = tokenizer.to_dict()
+        payload["tokenizer_summary"] = {
+            "vocab_size": tokenizer.vocab_size,
+            "version": tokenizer.VERSION,
+            "pretokenization": tokenizer.PRETOKENIZATION,
+            "n_merges": len(tokenizer.merges),
+        }
     if step is not None:
         payload["step"] = int(step)
+    # Egitimde kullanilan sistem-prompt'u checkpoint'e yaz: generate varsayilani
+    # bu olsun, boylece --system-mode safe ile egitilen model dogru prompt'u gorur.
+    if system_prompt is not None:
+        payload["system_prompt"] = system_prompt
+    if system_mode is not None:
+        payload["system_mode"] = system_mode
+    meta = dict(meta or {})
+    meta.setdefault("git_commit", _git_commit())
+    payload["meta"] = meta
     torch.save(payload, str(save_path))
 
 
@@ -71,6 +104,18 @@ def load_tokenizer_from_checkpoint(path: str) -> BPETokenizer | None:
     if not data:
         return None
     return BPETokenizer.from_dict(data, allow_legacy=True)
+
+
+def load_checkpoint_metadata(path: str) -> dict:
+    """Checkpoint'teki egitim meta verisini (sistem-prompt, mod, veri, commit) dondurur."""
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    return {
+        "system_prompt": payload.get("system_prompt"),
+        "system_mode": payload.get("system_mode"),
+        "meta": payload.get("meta") or {},
+        "tokenizer_summary": payload.get("tokenizer_summary") or {},
+        "step": payload.get("step"),
+    }
 
 
 def configure_optimizer(model: torch.nn.Module, cfg: TrainConfig):
@@ -103,13 +148,26 @@ def lr_at(step: int, cfg: TrainConfig) -> float:
 
 @torch.no_grad()
 def estimate_loss(model, data, cfg, device):
+    """Val kumesini bir kez dolasip token-agirlikli ortalama kaybi dondurur.
+
+    Her batch tek bir rastgele kovadan gelmez; tum val ornekleri tam olarak bir
+    kez gorulur (deterministik). Ortalama, dolgu disi hedef token sayisina gore
+    agirliklandirilir; boylece val_loss ve perplexity tekrarlanabilir olur.
+    """
+    was_training = model.training
     model.eval()
-    losses = []
-    for _ in range(cfg.eval_iters):
-        src, tgt_in, tgt_out = data.get_batch("val", cfg.batch_size, device)
-        losses.append(forward_loss(model, src, tgt_in, tgt_out, cfg, device).item())
-    model.train()
-    return sum(losses) / max(1, len(losses))
+    total_loss = 0.0
+    total_tokens = 0
+    for src, tgt_in, tgt_out, in data.eval_batches("val", cfg.batch_size, device):
+        loss = forward_loss(model, src, tgt_in, tgt_out, cfg, device)
+        n = int((tgt_out != Seq2SeqDataset.IGNORE).sum())
+        if n == 0:
+            continue
+        total_loss += loss.item() * n
+        total_tokens += n
+    if was_training:
+        model.train()
+    return total_loss / max(1, total_tokens)
 
 
 def forward_loss(model, src, tgt_in, tgt_out, cfg, device):
@@ -125,7 +183,7 @@ def forward_loss(model, src, tgt_in, tgt_out, cfg, device):
     return loss
 
 
-def train_model(cfg: TrainConfig, device: torch.device | None = None, ckpt_path: str | None = None, tokenizer: BPETokenizer | None = None, texts=None):
+def train_model(cfg: TrainConfig, device: torch.device | None = None, ckpt_path: str | None = None, tokenizer: BPETokenizer | None = None, texts=None, system_prompt: str | None = None, system_mode: str | None = None, meta: dict | None = None, keep_best: bool = False, early_stop: int = 0):
     device = device or pick_device()
     # Veri kurulumu deterministik olsun diye taban tohum; resume'da batch akisini
     # farklilastirmak icin start_step kadar kaydirilir (asagida).
@@ -185,6 +243,9 @@ def train_model(cfg: TrainConfig, device: torch.device | None = None, ckpt_path:
 
     accum = max(1, cfg.grad_accum)
 
+    best_val = float("inf")
+    best_path = ckpt_path + ".best" if keep_best else None
+    bad_evals = 0
     last_step = start_step - 1
     for step in range(start_step, cfg.epochs + 1):
         lr = lr_at(step, cfg)
@@ -222,12 +283,27 @@ def train_model(cfg: TrainConfig, device: torch.device | None = None, ckpt_path:
 
         if data is not None and (step % cfg.eval_every == 0 or step == cfg.epochs):
             val = estimate_loss(model, data, cfg, device)
-            print(f"eval step={step} val_loss={val:.4f}", flush=True)
+            print(f"eval step={step} val_loss={val:.4f} ppl={math.exp(val):.2f}", flush=True)
+            if val < best_val - 1e-6:
+                best_val = val
+                bad_evals = 0
+                if best_path is not None:
+                    save_checkpoint(model, cfg, best_path, optimizer=optim, step=step, scaler=scaler,
+                                    tokenizer=tokenizer, system_prompt=system_prompt,
+                                    system_mode=system_mode, meta={**(meta or {}), "best_val": best_val})
+                    print(f"  yeni en iyi val_loss={best_val:.4f} -> {best_path}", flush=True)
+            else:
+                bad_evals += 1
+                if early_stop and bad_evals >= early_stop:
+                    print(f"erken durdurma: {bad_evals} degerlendirmedir iyilesme yok.", flush=True)
+                    break
 
         if step % cfg.save_every == 0 or step == cfg.epochs:
-            save_checkpoint(model, cfg, ckpt_path, optimizer=optim, step=step, scaler=scaler, tokenizer=tokenizer)
+            save_checkpoint(model, cfg, ckpt_path, optimizer=optim, step=step, scaler=scaler, tokenizer=tokenizer,
+                            system_prompt=system_prompt, system_mode=system_mode, meta=meta)
 
-    save_checkpoint(model, cfg, ckpt_path, optimizer=optim, step=last_step, scaler=scaler, tokenizer=tokenizer)
+    save_checkpoint(model, cfg, ckpt_path, optimizer=optim, step=last_step, scaler=scaler, tokenizer=tokenizer,
+                    system_prompt=system_prompt, system_mode=system_mode, meta=meta)
     print(f"checkpoint saved: {ckpt_path}")
     return model, cfg
 
@@ -248,13 +324,15 @@ def add_train_args(ap) -> None:
     )
     ap.add_argument(
         "--system-mode",
-        choices=["default", "safe", "open", "reasoning"],
+        choices=sorted(SYSTEM_PROMPTS),
         default="default",
         help="sistem-prompt modu: safe=censored (reddeden), open=uncensored (dolaysiz)",
     )
     ap.add_argument("--ckpt", default=str(root / "decoder_model_ckpt.pt"))
     ap.add_argument("--tokenizer", default=str(data_dir / "tokenizer.json"))
     ap.add_argument("--device", default=None)
+    ap.add_argument("--max-examples", type=int, default=100000,
+                    help="egitim ornegi ust siniri (eleme sonrasi uygulanir)")
 
     ap.add_argument("--steps", type=int, default=8000, help="toplam optimizasyon adimi (epochs)")
     ap.add_argument("--batch-size", type=int, default=d["batch_size"])
@@ -289,6 +367,8 @@ def add_train_args(ap) -> None:
     ap.add_argument("--grad-checkpointing", action="store_true", default=d["grad_checkpointing"])
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--keep-best", action="store_true", help="en iyi val kaybini ayri dosyaya (.best) kaydet")
+    ap.add_argument("--early-stop", type=int, default=0, help="iyilesme olmadan bu kadar eval sonra dur (0=kapali)")
     ap.add_argument("--seed", type=int, default=d["seed"])
 
     ap.add_argument("--val-frac", type=float, default=d["val_frac"])
@@ -357,11 +437,14 @@ def main(argv=None):
 
     dialogues = load_jsonl_records(args.data)
     extra_paths = args.extra_data if args.extra_data is not None else [str(Path(__file__).resolve().parents[3] / "data" / "data.jsonl")]
+    used_paths = [args.data]
     for extra_path in extra_paths:
         if extra_path and os.path.exists(extra_path):
             dialogues += load_jsonl_records(extra_path)
+            used_paths.append(extra_path)
+    system_prompt = system_prompt_for(args.system_mode)
     corpus = build_assistant_only_corpus(
-        dialogues, system_prompt=system_prompt_for(args.system_mode), max_examples=100000
+        dialogues, system_prompt=system_prompt, max_examples=args.max_examples
     )
     print(f"korpus: {len(corpus)} ornek", flush=True)
 
@@ -384,7 +467,17 @@ def main(argv=None):
 
     cfg = config_from_args(args, tokenizer.vocab_size)
     device = pick_device() if args.device is None else torch.device(args.device)
-    train_model(cfg, device=device, ckpt_path=args.ckpt, tokenizer=tokenizer, texts=corpus)
+    meta = {
+        "data_files": used_paths,
+        "system_mode": args.system_mode,
+        "n_examples": len(corpus),
+        "vocab_size": tokenizer.vocab_size,
+    }
+    train_model(
+        cfg, device=device, ckpt_path=args.ckpt, tokenizer=tokenizer, texts=corpus,
+        system_prompt=system_prompt, system_mode=args.system_mode, meta=meta,
+        keep_best=args.keep_best, early_stop=args.early_stop,
+    )
 
 
 if __name__ == "__main__":

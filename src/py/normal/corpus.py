@@ -16,6 +16,18 @@ def _has_special_token(text: str) -> bool:
     return any(marker in lowered for marker in BPETokenizer.SPECIAL_STRINGS)
 
 
+_TR_LOWER_TABLE = str.maketrans({"I": "ı", "İ": "i"})
+
+
+def tr_lower(text: str) -> str:
+    """Turkce'ye duyarli kucuk harf: I->i degil I->ı, İ->i.
+
+    Python'un varsayilan `.lower()` (I->i) dedup anahtarlarinda yanlis eslesmeye
+    yol acar; bu fonksiyon dogru esleme yapar.
+    """
+    return str(text).translate(_TR_LOWER_TABLE).lower()
+
+
 def messages_to_turns(messages):
     """ChatML tarzi `messages` listesini [ [user, assistant], ... ] turlarina cevirir.
 
@@ -110,7 +122,7 @@ def build_instruction_corpus(dialogues, system_prompt: str | None = None, max_tu
                 continue
             key = (dialogue_system,
                    tuple((m["role"], m["content"]) for m in history),
-                   user_text.lower(), assistant_text.lower())
+                   tr_lower(user_text), tr_lower(assistant_text))
             if key not in seen:
                 seen.add(key)
                 corpus.append({
@@ -136,7 +148,7 @@ def build_assistant_only_corpus(dialogues, system_prompt: str | None = None, max
         assistant = clean_text(item["assistant"], keep_newlines=True)
         if len(user) < 4 or len(assistant) < 4:
             continue
-        if assistant.lower().startswith(user.lower()[:20]):
+        if tr_lower(assistant).startswith(tr_lower(user)[:20]):
             continue
         if _has_special_token(user) or _has_special_token(assistant):
             continue
@@ -146,7 +158,7 @@ def build_assistant_only_corpus(dialogues, system_prompt: str | None = None, max
             if clean_text(m.get("content", ""), keep_newlines=True)
         ]
         key = (clean_text(item.get("system", ""), keep_newlines=True),
-               tuple((m["role"], m["content"]) for m in history), user.lower(), assistant.lower())
+               tuple((m["role"], m["content"]) for m in history), tr_lower(user), tr_lower(assistant))
         if key in seen:
             continue
         seen.add(key)

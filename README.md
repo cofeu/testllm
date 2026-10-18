@@ -44,8 +44,13 @@ Diğer dizinler:
 | `data/instruct.jsonl` | Talimat sohbeti havuzu (chatml dönüşümü + elle yazılan örnekler, çok turlu). |
 | `data/reasoning.jsonl` | Adım adım düşünme (CoT) havuzu (`scripts/make_reasoning_data.py` ile üretilir). |
 | `data/modes.jsonl` | Censored (safe) / uncensored (open) davranış çiftleri (`scripts/make_mode_data.py`). |
-| `data/tokenizer.json` | Önbelleklenmiş BPE tokenizer (vocab 2048). |
+| `data/tokenizer.json` | Önbelleklenmiş BPE tokenizer (vocab 2048, şema `prefix_space_v2`). |
 | `data/chatml_instruct.jsonl` | Eğitimde kullanılan temizlenmiş chatml çıktısı (otomatik üretilir). |
+
+> **Lisans notu.** `data/data_large.jsonl` kamuya açık Türkçe talimat veri
+> setlerinden türetilmiştir (`TFLai/Turkish-Alpaca`, `merve/turkish_instructions`).
+> Orijinal Alpaca verisi CC BY-NC idi; Türkçe çevirilerin lisansını kullanmadan
+> önce ilgili kaynaklardan doğrulayın.
 
 Format (her satır bir diyalog):
 
@@ -93,8 +98,24 @@ ile eğitince model her iki davranışı öğrenir.
 ```
 
 Tek modelden iki ayrı davranış (daha keskin ayrım) için modeli iki kez eğit:
-`--system-mode safe` ve `--system-mode open` (kayıt bazlı `system` alanı yoksa tüm
-veri o modun prompt'uyla eğitilir).
+`--system-mode safe` ve `--system-mode open`. Bu iki **ayrı model** üretir (her
+biri kendi davranışını her zaman uygular). Tek bir modelin sistem-prompt'a göre
+**geçiş yapması** için kontrastlı veri gerekir; `data/modes.jsonl` bunu sağlar
+(aynı soruya iki farklı sistem altında iki farklı cevap). Eğitilen mod
+checkpoint'e yazılır; `generate` `--mode` verilmezse checkpoint'teki modu kullanır:
+
+```
+# egitimde modu sabitle
+.venv/bin/python -m src.py.normal.train --system-mode safe --ckpt safe_ckpt.pt ...
+# uretimde mod belirtme; checkpoint'teki 'safe' kullanilir
+.venv/bin/python -m src.py.normal.generate --ckpt safe_ckpt.pt --prompt "..."
+# gecersiz kil
+.venv/bin/python -m src.py.normal.generate --ckpt safe_ckpt.pt --mode open --prompt "..."
+```
+
+Sistem-prompt önceliği: `--system` > `--mode` > checkpoint'te kayıtlı mod >
+`default`. Kullanıcı/geçmiş metnindeki `<|im_start|>` gibi özel token kalıpları
+prompt kurulurken temizlenir; bu **çıkarımda sistem-prompt enjeksiyonunu** engeller.
 
 
 ## Kurulum
@@ -114,11 +135,11 @@ python3 -m venv .venv
 .venv/bin/python -m src.py.normal
 ```
 
-Bu komut sırayla: `data/data.jsonl` + `data/data_large.jsonl` yükler →
-`build_assistant_only_corpus` ile temizler → tokenizer'ı (`data/tokenizer.json`
-varsa yükler, yoksa eğitip kaydeder) → modeli eğitir → örnek üretir →
-checkpoint'i yeniden yükleyip üretimi doğrular. Checkpoint:
-`decoder_model_ckpt.pt` (proje kökü).
+Bu komut eğitim CLI'sine (`train.main`) **delege eder**. `data/data_large.jsonl`
+yüklenir (veya `--data`) → `build_assistant_only_corpus` ile temizlenir →
+tokenizer (`data/tokenizer.json` şema uyumluysa yüklenir, değilse eğitilip
+kaydedilir) → model eğitilir. Checkpoint: `decoder_model_ckpt.pt` (proje kökü).
+Üretim için `python -m src.py.normal.generate` kullanılır.
 
 Varsayılan model (Llama tarzı): vocab 2048, d_model 256, 8 encoder + 8 decoder
 katmanı, 8 kafa, 2 KV kafası (GQA, `n_rep=4`), ff 1024 (SwiGLU), blok 256
@@ -153,7 +174,17 @@ sonrası uygulanır.
 Öne çıkan eğitim argümanları: `--d-model --n-layers --n-head --n-kv-head
 --ff-dim --block-size --lr --warmup --grad-accum --dropout --qk-norm --no-rope
 --norm {rmsnorm,layernorm} --activation {swiglu,gelu} --grad-checkpointing
---resume --compile`.
+--resume --compile --system-mode {default,safe,open,reasoning} --max-examples
+--keep-best --early-stop N`.
+
+- `--max-examples N`: eğitim örneği üst sınırı (eleme sonrası uygulanır).
+- `--keep-best`: en iyi `val_loss` checkpoint'ini `<ckpt>.best` olarak kaydeder.
+- `--early-stop N`: N değerlendirmedir iyileşme yoksa eğitimi durdurur (0=kapalı).
+- Değerlendirme (`eval`) **deterministik** ve **token-ağırlıklı**dır: tüm val
+  kümesini bir kez dolaşır, hem `val_loss` hem `ppl` yazdırır.
+
+`generate` argümanları: `--mode {default,safe,open,reasoning}`, `--system`,
+`--sampler {top_p,typical,mirostat}`, `--interactive`.
 
 ### Saf Python yolu (bağımlılıksız, eğitim amaçlı)
 
@@ -169,6 +200,8 @@ python3 src/py/custom/generate.py --prompt "K: Merhaba\nA:" --interactive
 ```
 PYTHONPATH=. .venv/bin/python -m pytest tests/ -q
 ```
+
+CI: `.github/workflows/tests.yml` her push/PR'de pytest'i (CPU torch ile) çalıştırır.
 
 ## Mimari ve performans notları
 
@@ -212,9 +245,11 @@ tarzı bileşenler yapılandırma ile açılır:
 - **QK-Norm** (`qk_norm=True`): Llama 3 stabilitiesi için q/k üzerine RMSNorm.
 - **z-loss** (`z_loss>0`): logit büyüklüğünü düzenleyen ek kayıp terimi; yalnızca
   `-100` olmayan (gerçek hedef) konumlarda hesaplanır.
-- **Prefix-space tokenizer** (GPT-2 tarzı): kelimeye başındaki boşluk dahil
-  edilir; tek başına boşluk tokeni ~%0,3'e iner ve aynı bağlama ~%27 daha fazla
-  metin sığar (token/kelime 3,13 → 2,32).
+- **Prefix-space tokenizer** (GPT-2 tarzı, şema `prefix_space_v2`): kelimeye
+  başındaki boşluk dahil edilir; tek başına boşluk tokeni ~%0,3'e iner ve aynı
+  bağlama ~%27 daha fazla metin sığar (token/kelime 3,13 → 2,32). v2, **satır
+  sonu içeren** veriyle yeniden eğitildiği için `"\n\n"` tek token'a birleşebilir;
+  v1 şemalı `data/tokenizer.json` uyumsuz sayılır ve otomatik yeniden eğitilir.
 - **Dinamik pad + int32 depolama**: `Seq2SeqDataset` satırları int32 düz
   dizilerde saklar (int64'e göre yarı bellek; blok boyutuna önceden doldurulmaz)
   ve `get_batch` yalnızca o batch'teki **en uzun** diziye kadar doldurur — böylece
@@ -237,5 +272,14 @@ tarzı bileşenler yapılandırma ile açılır:
   (pozisyon taşmasını önler).
 - **Özel token'lar**: `<pad>`=0, `<bos>`=1, `<eos>`=2, `<unk>`=3,
   `<|im_start|>`=4, `<|im_end|>`=5, bayt aralığı 6'dan başlar (`OFFSET=6`).
+- **Prompt enjeksiyon koruması**: `ChatPromptFormatter` sistem ve kullanıcı
+  içeriğinden özel token kalıplarını (`strip_special_tokens`) temizler; çıkarımda
+  kullanıcı `<|im_start|>system...` yazarak modu değiştiremez.
+- **Türkçe-duyarlı dedup**: korpus tekilleştirmesi `tr_lower` kullanır
+  (`I→ı`, `İ→i`); Python'un `str.lower()`'ı Türkçe I/İ için yanlış eşleme yapar.
+- **Checkpoint meta verisi**: sistem-prompt, mod, kullanılan veri dosyaları,
+  git commit ve tokenizer özeti (`vocab_size`, şema) checkpoint'e yazılır.
+- **Degerlendirme**: `estimate_loss` tüm val kümesini deterministik ve
+  token-ağırlıklı dolaşır (`Seq2SeqDataset.eval_batches`), `ppl` yazdırır.
 
 Geliştirme aşamasındadır.
