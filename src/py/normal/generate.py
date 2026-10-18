@@ -7,13 +7,13 @@ from .model import EncoderDecoderLM
 from .tokenizer import BPETokenizer
 
 
-def generate_from_ids(model: EncoderDecoderLM, tokenizer: BPETokenizer, prompt_ids, generation: GenerationConfig | None = None, device: torch.device | None = None):
-    """Token id'lerinden uretim (prompt string'ine gerek yok)."""
+def _run_generation(model: EncoderDecoderLM, tokenizer: BPETokenizer, prompt_ids, generation: GenerationConfig | None = None, device: torch.device | None = None):
+    """Ham uretilen token id listesini (BOS dahil) dondurur."""
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     generation = generation or GenerationConfig()
     prompt_ids = list(prompt_ids or [])
     if not prompt_ids:
-        return ""
+        return []
 
     if len(prompt_ids) > model.cfg.block_size:
         prompt_ids = prompt_ids[-model.cfg.block_size:]
@@ -39,14 +39,45 @@ def generate_from_ids(model: EncoderDecoderLM, tokenizer: BPETokenizer, prompt_i
         mirostat_tau=generation.mirostat_tau,
         mirostat_eta=generation.mirostat_eta,
     )
-    # Encoder-decoder'da cikti yalnizca uretilen cevaptir (prompt encoder'a gider).
-    output_ids = generated[0].tolist()
-    visible_ids = [idx for idx in output_ids if idx >= tokenizer.OFFSET]
-    if not visible_ids:
-        return ""
+    return generated[0].tolist()
 
-    decoded = tokenizer.decode(visible_ids)
-    return decoded.replace("\x00", "").strip()
+
+def split_thinking(output_ids, tokenizer):
+    """Uretilen id'leri (dusunme_id'leri, cevap_id'leri) olarak ayirir.
+
+    `<thinking>` ile `</thinking>` arasindaki gorunur token'lar dusunme blogudur;
+    kalani nihai cevaptir. Kapanmamis bir dusunme blogunda kalan her sey
+    dusunme sayilir (yanit bos kalir) - yarida kesilmis dusunme cevap sanilmasin.
+    """
+    thinking, answer = [], []
+    in_think = False
+    for idx in output_ids:
+        if idx == tokenizer.THINK_START:
+            in_think = True
+            continue
+        if idx == tokenizer.THINK_END:
+            in_think = False
+            continue
+        if idx < tokenizer.OFFSET:
+            continue
+        (thinking if in_think else answer).append(idx)
+    return thinking, answer
+
+
+def generate_thinking(model: EncoderDecoderLM, tokenizer: BPETokenizer, prompt_ids, generation: GenerationConfig | None = None, device: torch.device | None = None):
+    """Uretimi calistirip `{"thinking", "answer", "ids"}` dondurur."""
+    output_ids = _run_generation(model, tokenizer, prompt_ids, generation, device)
+    thinking_ids, answer_ids = split_thinking(output_ids, tokenizer)
+    return {
+        "thinking": tokenizer.decode(thinking_ids).replace("\x00", "").strip(),
+        "answer": tokenizer.decode(answer_ids).replace("\x00", "").strip(),
+        "ids": output_ids,
+    }
+
+
+def generate_from_ids(model: EncoderDecoderLM, tokenizer: BPETokenizer, prompt_ids, generation: GenerationConfig | None = None, device: torch.device | None = None):
+    """Nihai cevabi (dusunme blogu haric) dondurur."""
+    return generate_thinking(model, tokenizer, prompt_ids, generation, device)["answer"]
 
 
 def generate_text(model: EncoderDecoderLM, tokenizer: BPETokenizer, prompt: str, generation: GenerationConfig | None = None, device: torch.device | None = None):
@@ -82,6 +113,8 @@ def main(argv=None):
     ap.add_argument("--sampler", choices=["top_p", "typical", "mirostat"], default="top_p")
     ap.add_argument("--device", default=None)
     ap.add_argument("--interactive", action="store_true")
+    ap.add_argument("--no-thinking", action="store_true",
+                    help="modelin <thinking> blogunu gosterme (yalnizca nihai cevap)")
     args = ap.parse_args(argv)
 
     device = pick_device() if args.device is None else torch.device(args.device)
@@ -112,12 +145,14 @@ def main(argv=None):
 
     def ask(text):
         prompt_ids = formatter.format_ids(tokenizer, text, history=history)
-        out = generate_from_ids(model, tokenizer, prompt_ids, gen, device)
-        print(f"asistan> {out}")
+        result = generate_thinking(model, tokenizer, prompt_ids, gen, device)
+        if result["thinking"] and not args.no_thinking:
+            print(f"<thinking>\n{result['thinking']}\n</thinking>")
+        print(f"asistan> {result['answer']}")
         history.append({"role": "user", "content": text})
-        history.append({"role": "assistant", "content": out})
+        history.append({"role": "assistant", "content": result["answer"]})
         del history[:-8]
-        return out
+        return result["answer"]
 
     if args.interactive:
         print("Cikmak icin 'q' yazin.")

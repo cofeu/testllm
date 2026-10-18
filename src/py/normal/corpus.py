@@ -11,9 +11,16 @@ from .prompt import DEFAULT_SYSTEM_PROMPT, clean_text
 from .tokenizer import BPETokenizer
 
 
-def _has_special_token(text: str) -> bool:
-    lowered = text.lower()
-    return any(marker in lowered for marker in BPETokenizer.SPECIAL_STRINGS)
+def _has_special_token(text: str, allow=()) -> bool:
+    """Metinde ozel token kalıbı var mi? `allow` ile istisna tanimlanabilir.
+
+    Asistan hedefi icin `allow=BPETokenizer.THINKING_STRINGS` verilir; boylece
+    modelin urettigi `<thinking>...</thinking>` blogu egitimde korunur, fakat
+    `<|im_start|>` gibi mod enjeksiyon token'lari yine reddedilir.
+    """
+    lowered = str(text).lower()
+    allowed = set(allow)
+    return any(marker in lowered and marker not in allowed for marker in BPETokenizer.SPECIAL_STRINGS)
 
 
 _TR_LOWER_TABLE = str.maketrans({"I": "ı", "İ": "i"})
@@ -118,7 +125,7 @@ def build_instruction_corpus(dialogues, system_prompt: str | None = None, max_tu
             assistant_text = clean_text(assistant, keep_newlines=True)
             if len(user_text) < 3 or len(assistant_text) < 5:
                 continue
-            if _has_special_token(user_text) or _has_special_token(assistant_text):
+            if _has_special_token(user_text) or _has_special_token(assistant_text, allow=BPETokenizer.THINKING_STRINGS):
                 continue
             key = (dialogue_system,
                    tuple((m["role"], m["content"]) for m in history),
@@ -150,7 +157,7 @@ def build_assistant_only_corpus(dialogues, system_prompt: str | None = None, max
             continue
         if tr_lower(assistant).startswith(tr_lower(user)[:20]):
             continue
-        if _has_special_token(user) or _has_special_token(assistant):
+        if _has_special_token(user) or _has_special_token(assistant, allow=BPETokenizer.THINKING_STRINGS):
             continue
         history = [
             {"role": m.get("role"), "content": clean_text(m.get("content", ""), keep_newlines=True)}

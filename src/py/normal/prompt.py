@@ -83,6 +83,19 @@ def clean_text(value, keep_newlines: bool = False):
     return text.strip()
 
 
+def wrap_thinking(thinking: str, answer: str) -> str:
+    """Dusunme blogunu (Claude tarzi) ve nihai cevabi birlestirir.
+
+    Egitim hedefi (assistant) bu sekilde yazilirsa model `<thinking>`/`</thinking>`
+    ozel token'larini ogrenir; cikarimda `generate` bunlari ayri dondurur.
+    """
+    thinking = clean_text(thinking, keep_newlines=True)
+    answer = clean_text(answer, keep_newlines=True)
+    if not thinking:
+        return answer
+    return f"<thinking>\n{thinking}\n</thinking>\n{answer}"
+
+
 class ChatPromptFormatter:
     def __init__(self, system_prompt: str | None = None):
         self.system_prompt = strip_special_tokens(

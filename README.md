@@ -44,7 +44,7 @@ Diğer dizinler:
 | `data/instruct.jsonl` | Talimat sohbeti havuzu (chatml dönüşümü + elle yazılan örnekler, çok turlu). |
 | `data/reasoning.jsonl` | Adım adım düşünme (CoT) havuzu (`scripts/make_reasoning_data.py` ile üretilir). |
 | `data/modes.jsonl` | Censored (safe) / uncensored (open) davranış çiftleri (`scripts/make_mode_data.py`). |
-| `data/tokenizer.json` | Önbelleklenmiş BPE tokenizer (vocab 2048, şema `prefix_space_v2`). |
+| `data/tokenizer.json` | Önbelleklenmiş BPE tokenizer (vocab 2048, şema `prefix_space_v3`). |
 | `data/chatml_instruct.jsonl` | Eğitimde kullanılan temizlenmiş chatml çıktısı (otomatik üretilir). |
 
 > **Lisans notu.** `data/data_large.jsonl` kamuya açık Türkçe talimat veri
@@ -189,7 +189,7 @@ sonrası uygulanır.
   `label_smoothing=0` ve `z_loss=0` iken geçerlidir).
 
 `generate` argümanları: `--mode {default,safe,open,reasoning}`, `--system`,
-`--sampler {top_p,typical,mirostat}`, `--interactive`.
+`--sampler {top_p,typical,mirostat}`, `--interactive`, `--no-thinking`.
 
 ### Saf Python yolu (bağımlılıksız, eğitim amaçlı)
 
@@ -250,11 +250,12 @@ tarzı bileşenler yapılandırma ile açılır:
 - **QK-Norm** (`qk_norm=True`): Llama 3 stabilitiesi için q/k üzerine RMSNorm.
 - **z-loss** (`z_loss>0`): logit büyüklüğünü düzenleyen ek kayıp terimi; yalnızca
   `-100` olmayan (gerçek hedef) konumlarda hesaplanır.
-- **Prefix-space tokenizer** (GPT-2 tarzı, şema `prefix_space_v2`): kelimeye
+- **Prefix-space tokenizer** (GPT-2 tarzı, şema `prefix_space_v3`): kelimeye
   başındaki boşluk dahil edilir; tek başına boşluk tokeni ~%0,3'e iner, instruct
-  verisinde token/kelime ≈ 2,35. v2'de `SEED_MERGES` ile `"\n\n"` **her koşulda**
-  (veride hiç çift satır sonu olmasa bile) tek token'a birleşir; v1 şemalı
-  `data/tokenizer.json` uyumsuz sayılır ve otomatik yeniden eğitilir.
+  verisinde token/kelime ≈ 2,35. `SEED_MERGES` ile `"\n\n"` **her koşulda**
+  (veride hiç çift satır sonu olmasa bile) tek token'a birleşir. v3,
+  `<thinking>`/`</thinking>` özel token'larını ekler (`OFFSET` 6→8); v2 ve
+  önceki şemalı `data/tokenizer.json` uyumsuz sayılır ve otomatik yeniden eğitilir.
 - **Dinamik pad + int32 depolama**: `Seq2SeqDataset` satırları int32 düz
   dizilerde saklar (int64'e göre yarı bellek; blok boyutuna önceden doldurulmaz)
   ve `get_batch` yalnızca o batch'teki **en uzun** diziye kadar doldurur — böylece
@@ -276,7 +277,16 @@ tarzı bileşenler yapılandırma ile açılır:
   `repetition_penalty`. `generate()` çıktıyı `block_size − 1` token ile sınırlar
   (pozisyon taşmasını önler).
 - **Özel token'lar**: `<pad>`=0, `<bos>`=1, `<eos>`=2, `<unk>`=3,
-  `<|im_start|>`=4, `<|im_end|>`=5, bayt aralığı 6'dan başlar (`OFFSET=6`).
+  `<|im_start|>`=4, `<|im_end|>`=5, `<thinking>`=6, `</thinking>`=7, bayt aralığı
+  8'den başlar (`OFFSET=8`).
+- **Düşünme bloğu (`<thinking>`, Claude tarzı)**: model asistan hedefini
+  `<thinking>...adımlar...</thinking>` + nihai cevap biçiminde üretir. Çıkarımda
+  `generate`/`generate_thinking` bu bloğu nihai cevaptan ayırır (`split_thinking`);
+  CLI `<thinking>` bloğunu ayrı yazdırır, `--no-thinking` ile gizlenir. Eğitim
+  hedefinde bu iki token'a izin verilir ama `<|im_start|>` gibi diğer özel
+  token'lar reddedilir; kullanıcı metninde `<thinking>` de temizlenir.
+  `data/reasoning.jsonl`'i `python scripts/make_reasoning_data.py --think-tags`
+  ile üretince adımlar bu bloğa taşınır. Yardımcı: `prompt.wrap_thinking`.
 - **Prompt enjeksiyon koruması**: `ChatPromptFormatter` sistem ve kullanıcı
   içeriğinden özel token kalıplarını (`strip_special_tokens`) temizler; çıkarımda
   kullanıcı `<|im_start|>system...` yazarak modu değiştiremez.

@@ -12,6 +12,7 @@ yapilandirilmis cikti ve "bilmiyorum/emin degilim" davranisini ogretmek.
 
 Kullanim:
     python scripts/make_reasoning_data.py --out data/reasoning.jsonl --per-category 120
+    python scripts/make_reasoning_data.py --out data/reasoning.jsonl --think-tags
 """
 
 import argparse
@@ -33,6 +34,20 @@ def _steps(*lines, sonuc=None, giris=None):
     if sonuc is not None:
         out.append(f"Sonuç: {sonuc}")
     return "\n".join(out)
+
+
+def _with_thinking(answer: str) -> str:
+    """Adimlari `<thinking>...</thinking>` icine alir, `Sonuç:` satirini disarida birakir.
+
+    Sonuç satiri olmayan cevaplar (JSON, nasil-yapilir, dogrudan) oldugu gibi kalir.
+    """
+    lines = answer.split("\n")
+    idx = next((i for i, line in enumerate(lines) if line.startswith("Sonuç:")), None)
+    if idx is None or idx == 0:
+        return answer
+    think = "\n".join(lines[:idx])
+    rest = "\n".join(lines[idx:])
+    return f"<thinking>\n{think}\n</thinking>\n{rest}"
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +443,7 @@ CATEGORIES = [
 ]
 
 
-def generate(per_category: int, seed: int):
+def generate(per_category: int, seed: int, think: bool = False):
     r = random.Random(seed)
     rows = []
     seen = set()
@@ -438,6 +453,8 @@ def generate(per_category: int, seed: int):
         while made < per_category and attempts < per_category * 20:
             attempts += 1
             q, a = fn(r)
+            if think:
+                a = _with_thinking(a)
             key = (q.strip().lower(), a.strip().lower())
             if key in seen:
                 continue
@@ -454,9 +471,11 @@ def main(argv=None):
     ap.add_argument("--out", default=str(root / "data" / "reasoning.jsonl"))
     ap.add_argument("--per-category", type=int, default=120)
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--think-tags", action="store_true",
+                    help="cozum adimlarini <thinking>...</thinking> icine al (Claude tarzi)")
     args = ap.parse_args(argv)
 
-    rows = generate(args.per_category, args.seed)
+    rows = generate(args.per_category, args.seed, think=args.think_tags)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:

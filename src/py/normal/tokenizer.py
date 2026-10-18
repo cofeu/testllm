@@ -13,16 +13,23 @@ class BPETokenizer:
     BOS = 1
     EOS = 2
     UNK = 3
-    IM_START = 4   # <|im_start|>
-    IM_END = 5     # <|im_end|>
-    OFFSET = 6
-    SPECIAL_STRINGS = ["<pad>", "<bos>", "<eos>", "<unk>", "<|im_start|>", "<|im_end|>"]
-    VERSION = 2
-    # v2: satir sonu (\n) iceren veriyle yeniden egitilmis merge'ler. Ayrica
-    # SEED_MERGES her zaman en yuksek oncelikle uygulanir; boylece "\n\n" tek
-    # token'a birlesir (siklik siralamasina takilmaz). Eski v1 dosyalari
-    # uyumsuz sayilip yeniden egitilir.
-    PRETOKENIZATION = "prefix_space_v2"
+    IM_START = 4        # <|im_start|>
+    IM_END = 5          # <|im_end|>
+    THINK_START = 6     # <thinking>
+    THINK_END = 7       # </thinking>
+    OFFSET = 8
+    SPECIAL_STRINGS = [
+        "<pad>", "<bos>", "<eos>", "<unk>",
+        "<|im_start|>", "<|im_end|>", "<thinking>", "</thinking>",
+    ]
+    # Cevap hedefinde (assistant) bulunmasina izin verilen ozel token'lar:
+    # modelin urettigi dusunme blogu. Kullanici/gecmis metninde bunlar da
+    # temizlenir (enjeksiyon onleme).
+    THINKING_STRINGS = ("<thinking>", "</thinking>")
+    VERSION = 3
+    # v3: <thinking>/</thinking> ozel token'lari eklendi (OFFSET 6 -> 8). v2 ve
+    # onceki dosyalar uyumsuz sayilip yeniden egitilir. v2: "\n\n" tohum merge.
+    PRETOKENIZATION = "prefix_space_v3"
     SEED_MERGES = [(b"\n", b"\n")]
 
     def __init__(self, vocab_size=1024, merges=None):
@@ -84,7 +91,13 @@ class BPETokenizer:
         for text in texts:
             if text is None:
                 continue
-            text = str(text).strip()
+            text = str(text)
+            # Ozel token kalıplarini BPE korpusundan cikar: tek id olarak
+            # kodlanirlar, mergelerini ogrenmek boşa yer harcar.
+            for special in cls.SPECIAL_STRINGS:
+                if special in text:
+                    text = text.replace(special, " ")
+            text = text.strip()
             if not text:
                 continue
             words.extend(bytes(part, "utf-8") for part in re.findall(r" ?[^\s]+|\s+", text))

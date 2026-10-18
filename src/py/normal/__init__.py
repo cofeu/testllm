@@ -63,13 +63,16 @@ from .prompt import (
     format_instruction_example,
     strip_special_tokens,
     system_prompt_for,
+    wrap_thinking,
 )
 from .tokenizer import BPETokenizer
+from .generate import generate_from_ids, generate_text, generate_thinking, split_thinking
 from .train import (
     configure_optimizer,
     estimate_loss,
     forward_loss,
     load_checkpoint,
+    load_checkpoint_bundle,
     load_checkpoint_metadata,
     load_tokenizer_from_checkpoint,
     lr_at,
@@ -98,6 +101,7 @@ __all__ = [
     "format_chat_prompt",
     "format_instruction_example",
     "strip_special_tokens",
+    "wrap_thinking",
     # model
     "EncoderDecoderLM",
     "EncoderBlock",
@@ -130,6 +134,7 @@ __all__ = [
     "load_checkpoint",
     "load_tokenizer_from_checkpoint",
     "load_checkpoint_metadata",
+    "load_checkpoint_bundle",
     "configure_optimizer",
     "lr_at",
     "estimate_loss",
@@ -137,4 +142,7 @@ __all__ = [
     "train_model",
     # generate
     "generate_text",
+    "generate_from_ids",
+    "generate_thinking",
+    "split_thinking",
 ]
