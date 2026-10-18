@@ -7,16 +7,11 @@ from .model import EncoderDecoderLM
 from .tokenizer import BPETokenizer
 
 
-def generate_text(model: EncoderDecoderLM, tokenizer: BPETokenizer, prompt: str, generation: GenerationConfig | None = None, device: torch.device | None = None):
+def generate_from_ids(model: EncoderDecoderLM, tokenizer: BPETokenizer, prompt_ids, generation: GenerationConfig | None = None, device: torch.device | None = None):
+    """Token id'lerinden uretim (prompt string'ine gerek yok)."""
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     generation = generation or GenerationConfig()
-    prompt_text = str(prompt or "")
-    if not prompt_text.strip():
-        return ""
-    if not prompt_text.endswith("\n"):
-        prompt_text = prompt_text + "\n"
-
-    prompt_ids = tokenizer.encode(prompt_text)
+    prompt_ids = list(prompt_ids or [])
     if not prompt_ids:
         return ""
 
@@ -54,13 +49,22 @@ def generate_text(model: EncoderDecoderLM, tokenizer: BPETokenizer, prompt: str,
     return decoded.replace("\x00", "").strip()
 
 
+def generate_text(model: EncoderDecoderLM, tokenizer: BPETokenizer, prompt: str, generation: GenerationConfig | None = None, device: torch.device | None = None):
+    prompt_text = str(prompt or "")
+    if not prompt_text.strip():
+        return ""
+    if not prompt_text.endswith("\n"):
+        prompt_text = prompt_text + "\n"
+    return generate_from_ids(model, tokenizer, tokenizer.encode(prompt_text), generation, device)
+
+
 def main(argv=None):
     """CLI:  python -m src.py.normal.generate --prompt "Merhaba" [--interactive]"""
     import argparse
     from pathlib import Path
 
-    from .prompt import DEFAULT_SYSTEM_PROMPT, SYSTEM_PROMPTS, format_chat_prompt, system_prompt_for
-    from .train import load_checkpoint, load_checkpoint_metadata, pick_device
+    from .prompt import DEFAULT_SYSTEM_PROMPT, SYSTEM_PROMPTS, ChatPromptFormatter, system_prompt_for
+    from .train import load_checkpoint_bundle, pick_device
 
     root = Path(__file__).resolve().parents[3]
     ap = argparse.ArgumentParser(description="Modelden metin uret")
@@ -81,15 +85,10 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     device = pick_device() if args.device is None else torch.device(args.device)
-    model, _ = load_checkpoint(args.ckpt, device=device)
+    # Checkpoint'i TEK kez oku: model + meta + tokenizer.
+    model, _cfg, ckpt_meta, ckpt_tokenizer = load_checkpoint_bundle(args.ckpt, device=device)
 
     # Sistem-prompt onceligi: --system > --mode > checkpoint'te kayitli > default.
-    ckpt_meta = {}
-    if Path(args.ckpt).exists():
-        try:
-            ckpt_meta = load_checkpoint_metadata(str(args.ckpt))
-        except Exception:
-            ckpt_meta = {}
     if args.system is not None:
         system_prompt = args.system
     elif args.mode is not None:
@@ -107,12 +106,13 @@ def main(argv=None):
         repetition_penalty=args.repetition_penalty,
         sampler=args.sampler,
     )
-    tokenizer = _tokenizer_from_checkpoint_or(args.ckpt, root)
+    tokenizer = ckpt_tokenizer or _load_data_tokenizer(root)
+    formatter = ChatPromptFormatter(system_prompt=system_prompt)
     history = []
 
     def ask(text):
-        prompt = format_chat_prompt(text, system_prompt=system_prompt, history=history)
-        out = generate_text(model, tokenizer, prompt, generation=gen, device=device)
+        prompt_ids = formatter.format_ids(tokenizer, text, history=history)
+        out = generate_from_ids(model, tokenizer, prompt_ids, gen, device)
         print(f"asistan> {out}")
         history.append({"role": "user", "content": text})
         history.append({"role": "assistant", "content": out})
@@ -134,25 +134,15 @@ def main(argv=None):
         ask(args.prompt)
 
 
-def _tokenizer_from_checkpoint_or(ckpt, root):
-    """Once checkpoint'e gomulu tokenizer'i, yoksa data/tokenizer.json'i dener."""
+def _load_data_tokenizer(root):
+    """Checkpoint'te tokenizer yoksa `data/tokenizer.json`'i yukler."""
     import json
     from pathlib import Path
 
-    from .train import load_tokenizer_from_checkpoint
-
-    if ckpt and Path(ckpt).exists():
-        try:
-            tok = load_tokenizer_from_checkpoint(str(ckpt))
-        except Exception:
-            tok = None
-        if tok is not None:
-            return tok
-
-    for candidate in (Path(root) / "data" / "tokenizer.json",):
-        if candidate.exists():
-            with open(candidate, "r", encoding="utf-8") as f:
-                return BPETokenizer.from_dict(json.load(f), allow_legacy=True)
+    candidate = Path(root) / "data" / "tokenizer.json"
+    if candidate.exists():
+        with open(candidate, "r", encoding="utf-8") as f:
+            return BPETokenizer.from_dict(json.load(f), allow_legacy=True)
     raise FileNotFoundError("tokenizer bulunamadi; once egitim calistirin")
 
 

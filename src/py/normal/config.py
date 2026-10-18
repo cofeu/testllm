@@ -48,7 +48,6 @@ class TrainConfig:
     # ---- degerlendirme / kayit ----
     val_frac: float = 0.05
     eval_every: int = 500
-    eval_iters: int = 50
     save_every: int = 1000
     log_every: int = 100
 

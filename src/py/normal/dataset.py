@@ -54,9 +54,9 @@ class Seq2SeqDataset:
                 continue
             system = clean_text(item.get("system", ""), keep_newlines=True) or None
             history = item.get("history") or None
-            prompt = ChatPromptFormatter(system_prompt=system).format_prompt(user, history=history)
-
-            src_ids = tokenizer.encode(prompt)
+            src_ids = ChatPromptFormatter(system_prompt=system).format_ids(
+                tokenizer, user, history=history
+            )
             if len(src_ids) > self.block_size:
                 # Sondaki (en guncel) baglami koru; kullanicinin sorusu prompt'un
                 # sonunda yer alir, bastan kirpmak soruyu silebilir.

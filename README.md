@@ -179,9 +179,14 @@ sonrası uygulanır.
 
 - `--max-examples N`: eğitim örneği üst sınırı (eleme sonrası uygulanır).
 - `--keep-best`: en iyi `val_loss` checkpoint'ini `<ckpt>.best` olarak kaydeder.
-- `--early-stop N`: N değerlendirmedir iyileşme yoksa eğitimi durdurur (0=kapalı).
+  En iyi değer ve erken-durdurma sayacı checkpoint meta'sına yazılır; `--resume`
+  bunları devralır (`.best` yanlışlıkla ezilmez).
+- `--early-stop N`: iyileşme olmadan `N` değerlendirme sonra eğitimi durdurur (0=kapalı).
+- `--system-mode` verilmezse `default`; `--resume` sırasında checkpoint'teki mod
+  devralınır (aksi halde `safe` ile eğitilen model sessizce `default`a düşerdi).
 - Değerlendirme (`eval`) **deterministik** ve **token-ağırlıklı**dır: tüm val
-  kümesini bir kez dolaşır, hem `val_loss` hem `ppl` yazdırır.
+  kümesini bir kez dolaşır, `val_loss` yazdırır (`ppl` yalnızca
+  `label_smoothing=0` ve `z_loss=0` iken geçerlidir).
 
 `generate` argümanları: `--mode {default,safe,open,reasoning}`, `--system`,
 `--sampler {top_p,typical,mirostat}`, `--interactive`.
@@ -246,10 +251,10 @@ tarzı bileşenler yapılandırma ile açılır:
 - **z-loss** (`z_loss>0`): logit büyüklüğünü düzenleyen ek kayıp terimi; yalnızca
   `-100` olmayan (gerçek hedef) konumlarda hesaplanır.
 - **Prefix-space tokenizer** (GPT-2 tarzı, şema `prefix_space_v2`): kelimeye
-  başındaki boşluk dahil edilir; tek başına boşluk tokeni ~%0,3'e iner ve aynı
-  bağlama ~%27 daha fazla metin sığar (token/kelime 3,13 → 2,32). v2, **satır
-  sonu içeren** veriyle yeniden eğitildiği için `"\n\n"` tek token'a birleşebilir;
-  v1 şemalı `data/tokenizer.json` uyumsuz sayılır ve otomatik yeniden eğitilir.
+  başındaki boşluk dahil edilir; tek başına boşluk tokeni ~%0,3'e iner, instruct
+  verisinde token/kelime ≈ 2,35. v2'de `SEED_MERGES` ile `"\n\n"` **her koşulda**
+  (veride hiç çift satır sonu olmasa bile) tek token'a birleşir; v1 şemalı
+  `data/tokenizer.json` uyumsuz sayılır ve otomatik yeniden eğitilir.
 - **Dinamik pad + int32 depolama**: `Seq2SeqDataset` satırları int32 düz
   dizilerde saklar (int64'e göre yarı bellek; blok boyutuna önceden doldurulmaz)
   ve `get_batch` yalnızca o batch'teki **en uzun** diziye kadar doldurur — böylece

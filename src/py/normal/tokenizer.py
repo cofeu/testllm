@@ -18,9 +18,12 @@ class BPETokenizer:
     OFFSET = 6
     SPECIAL_STRINGS = ["<pad>", "<bos>", "<eos>", "<unk>", "<|im_start|>", "<|im_end|>"]
     VERSION = 2
-    # v2: satir sonu (\n) iceren veriyle yeniden egitilmis merge'ler; boylece
-    # "\n\n" tek token olabilir. Eski v1 dosyalari uyumsuz sayilip yeniden egitilir.
+    # v2: satir sonu (\n) iceren veriyle yeniden egitilmis merge'ler. Ayrica
+    # SEED_MERGES her zaman en yuksek oncelikle uygulanir; boylece "\n\n" tek
+    # token'a birlesir (siklik siralamasina takilmaz). Eski v1 dosyalari
+    # uyumsuz sayilip yeniden egitilir.
     PRETOKENIZATION = "prefix_space_v2"
+    SEED_MERGES = [(b"\n", b"\n")]
 
     def __init__(self, vocab_size=1024, merges=None):
         self.specials = list(self.SPECIAL_STRINGS)
@@ -109,16 +112,11 @@ class BPETokenizer:
 
         merges = []
         max_merges = max(0, vocab_size - cls.OFFSET - 256)
-        while len(merges) < max_merges and pair_counts:
-            best_count = max(pair_counts.values())
-            if best_count <= 0:
-                break
-            best_pair = max(p for p, c in pair_counts.items() if c == best_count)
-            a, b = best_pair
-            merged = a + b
 
-            affected = list(pair_words.pop(best_pair, ()))
-            pair_counts.pop(best_pair, None)
+        def apply_pair(a, b):
+            merged = a + b
+            affected = list(pair_words.pop((a, b), ()))
+            pair_counts.pop((a, b), None)
             for wi in affected:
                 w = word_list[wi]
                 f = freqs[wi]
@@ -145,6 +143,20 @@ class BPETokenizer:
                     pair_counts[pair] += f
                     pair_words[pair].add(wi)
             merges.append((a, b))
+
+        # Tohum merge'ler: veride sikligi ne olursa olsun her zaman uygulanir
+        # (ornegin "\n\n", corpus tek satir sonu icerse bile tek token olur).
+        for seed in cls.SEED_MERGES:
+            if len(merges) >= max_merges or seed in merges:
+                break
+            apply_pair(*seed)
+
+        while len(merges) < max_merges and pair_counts:
+            best_count = max(pair_counts.values())
+            if best_count <= 0:
+                break
+            best_pair = max(p for p, c in pair_counts.items() if c == best_count)
+            apply_pair(*best_pair)
 
         return cls(vocab_size=vocab_size, merges=merges)
 
@@ -205,7 +217,7 @@ class BPETokenizer:
         syms = self._bpe([bytes([b]) for b in data])
         return [self._token_to_id.get(tok, self.UNK) for tok in syms]
 
-    def encode(self, text):
+    def encode(self, text, allow_special: bool = True):
         if text is None:
             return []
         if isinstance(text, (bytes, bytearray)):
@@ -213,6 +225,10 @@ class BPETokenizer:
         data = str(text)
         if not data:
             return []
+        if not allow_special:
+            # Ozel token kalıpları metnin parcası sayilir (ozel token URETILMEZ).
+            # Kullanici/gecmis metnini enjekte edilemez sekilde kodlamak icin.
+            return self._encode_plain(data)
         present = [s for s in self.specials if s in data]
         if present:
             present.sort(key=len, reverse=True)

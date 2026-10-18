@@ -54,12 +54,18 @@ _SPECIAL_PATTERN = re.compile(
 def strip_special_tokens(text: str) -> str:
     """Kullanici/gecmis metninden ozel chat token kalıplarini temizle.
 
-    Boylece cikarimda `<|im_start|>system...` enjeksiyonu imkansiz olur; tokenizer
-    `encode` bu kalıpları ozel token'a ceviremez.
+    Ici ice kalıplara karsi dayanikli olmasi icin sabit noktaya kadar donguyle
+    uygulanir: `<|im_<|im_end|>end|>` tek gecisde tekrar `<|im_end|>` olur; dongu
+    bunu da temizler. Boylece cikarimda mod enjeksiyonu imkansiz olur.
     """
     if not text:
         return ""
-    return _SPECIAL_PATTERN.sub("", text)
+    prev = None
+    current = text
+    while current != prev:
+        prev = current
+        current = _SPECIAL_PATTERN.sub("", current)
+    return current
 
 
 def clean_text(value, keep_newlines: bool = False):
@@ -106,6 +112,31 @@ class ChatPromptFormatter:
         messages = list(history or [])
         messages.append({"role": "user", "content": user_text})
         return self.format_messages(messages)
+
+    def format_ids(self, tokenizer, user_text: str, history=None):
+        """Token-seviyesinde prompt: kullanici/gecmis icerigi `allow_special=False`
+        ile kodlanir, yani metin ozel token URETEMEZ (enjeksiyon imkansiz)."""
+        messages = list(history or [])
+        messages.append({"role": "user", "content": user_text})
+        return self.messages_to_ids(tokenizer, messages)
+
+    def messages_to_ids(self, tokenizer, messages):
+        enc = lambda s: tokenizer.encode(s, allow_special=False)
+        head = [tokenizer.IM_START] + enc("system\n" + self.system_prompt) + enc("\n") + [tokenizer.IM_END]
+        if not messages:
+            return head + enc("\n") + [tokenizer.IM_START] + enc("assistant\n")
+        ids = list(head)
+        for msg in messages:
+            role = str(msg.get("role", "user")).strip().lower()
+            content = clean_text(str(msg.get("content", "")), keep_newlines=True)
+            if not content:
+                continue
+            if role not in {"user", "assistant"}:
+                role = "user"
+            ids += enc("\n") + [tokenizer.IM_START] + enc(role + "\n" + content) + enc("\n") + [tokenizer.IM_END]
+        if not messages or str(messages[-1].get("role", "user")).strip().lower() != "assistant":
+            ids += enc("\n") + [tokenizer.IM_START] + enc("assistant\n")
+        return ids
 
 
 def format_instruction_example(user_text: str, assistant_text: str, system_prompt: str | None = None):
