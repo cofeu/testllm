@@ -64,14 +64,31 @@ def split_thinking(output_ids, tokenizer):
     return thinking, answer
 
 
+def thinking_closed(output_ids, tokenizer) -> bool:
+    """Uretimde `<thinking>` blogunun `</thinking>` ile kapanip kapanmadigi."""
+    in_think = False
+    for idx in output_ids:
+        if idx == tokenizer.THINK_START:
+            in_think = True
+        elif idx == tokenizer.THINK_END:
+            in_think = False
+    return not in_think
+
+
 def generate_thinking(model: EncoderDecoderLM, tokenizer: BPETokenizer, prompt_ids, generation: GenerationConfig | None = None, device: torch.device | None = None):
-    """Uretimi calistirip `{"thinking", "answer", "ids"}` dondurur."""
+    """Uretimi calistirip `{"thinking", "answer", "ids", "truncated"}` dondurur.
+
+    `truncated`: dusunme blogu `</thinking>` kapanmadan bitti (max_new_tokens
+    tasmadi). Boylece cikarimda "dusunme yarida kesildi, cevap bos olabilir"
+    uyari verilebilir.
+    """
     output_ids = _run_generation(model, tokenizer, prompt_ids, generation, device)
     thinking_ids, answer_ids = split_thinking(output_ids, tokenizer)
     return {
         "thinking": tokenizer.decode(thinking_ids).replace("\x00", "").strip(),
         "answer": tokenizer.decode(answer_ids).replace("\x00", "").strip(),
         "ids": output_ids,
+        "truncated": not thinking_closed(output_ids, tokenizer),
     }
 
 
@@ -104,7 +121,9 @@ def main(argv=None):
     ap.add_argument("--system", default=None, help="ozel sistem prompt'u (verilirse --mode ve checkpoint varsayilanini ezer)")
     ap.add_argument("--mode", choices=sorted(SYSTEM_PROMPTS), default=None,
                     help="hazir sistem-prompt modu: safe=censored, open=uncensored (varsayilan: checkpoint'te kayitli mod)")
-    ap.add_argument("--max-new-tokens", type=int, default=64)
+    # Dusunme blogu ~47 token (p90 62) tutuyor; 64 varsayilinda %9'u tasanip
+    # cevap bos kaliyordu, bu yuzden varsayilan 128.
+    ap.add_argument("--max-new-tokens", type=int, default=128)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top-k", type=int, default=40)
     ap.add_argument("--top-p", type=float, default=0.9)
@@ -146,9 +165,17 @@ def main(argv=None):
     def ask(text):
         prompt_ids = formatter.format_ids(tokenizer, text, history=history)
         result = generate_thinking(model, tokenizer, prompt_ids, gen, device)
+
         if result["thinking"] and not args.no_thinking:
             print(f"<thinking>\n{result['thinking']}\n</thinking>")
+
         print(f"asistan> {result['answer']}")
+        # Dusunme kapanmadan kesildiyse cevap bos kalir; hicbir sey basmamak
+        # hatayi gizler, bu yuzden her durumda acikla.
+        if result["truncated"]:
+            print(f"[uyari] dusunme blogu </thinking> oncesinde kesildi; cevap eksik/ bos olabilir. "
+                  f"--max-new-tokens'i artirin (su an {args.max_new_tokens}).")
+
         history.append({"role": "user", "content": text})
         history.append({"role": "assistant", "content": result["answer"]})
         del history[:-8]

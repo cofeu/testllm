@@ -189,7 +189,10 @@ sonrası uygulanır.
   `label_smoothing=0` ve `z_loss=0` iken geçerlidir).
 
 `generate` argümanları: `--mode {default,safe,open,reasoning}`, `--system`,
-`--sampler {top_p,typical,mirostat}`, `--interactive`, `--no-thinking`.
+`sampler {top_p,typical,mirostat}`, `--interactive`, `--no-thinking`,
+`--max-new-tokens` (varsayılan **128**; düşünme bloğu ort. ~47 token sürdüğü için
+64'te %9'u yarıda kesilip cevap boş kalıyordu). Üretim `</thinking>` üretilmeden
+biterse CLI'da `[uyari] dusunme blogu ... kesildi` satırı yazdırılır.
 
 ### Saf Python yolu (bağımlılıksız, eğitim amaçlı)
 

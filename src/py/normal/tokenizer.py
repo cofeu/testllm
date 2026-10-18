@@ -275,6 +275,9 @@ class BPETokenizer:
             "version": self.VERSION,
             "pretokenization": self.PRETOKENIZATION,
             "specials": list(self.SPECIAL_STRINGS),
+            # Ozel token id'leri OFFSET'ten itibaren sinifta hesaplanir; bu yuzden
+            # dosyaya da yazalim ki geri yuklerken uyuşmazlik gorunsun.
+            "offset": self.OFFSET,
             "vocab_size": self.vocab_size,
             "merges": [[list(a), list(b)] for a, b in self.merges],
         }
@@ -283,6 +286,31 @@ class BPETokenizer:
     def from_dict(cls, data, allow_legacy: bool = False):
         payload = data or {}
         marker = payload.get("pretokenization")
+
+        # En kritik kontrol: OFFSET/specials uyusmazligi ID KAYMASINA yol acar ve
+        # sessizce bozulur (eski 83 -> yeni 85 gibi). `allow_legacy` bunu da
+        # atlamaz: bozuk yukleme yerine acik hata verir.
+        stored_offset = payload.get("offset")
+        if stored_offset is not None and int(stored_offset) != cls.OFFSET:
+            raise ValueError(
+                f"tokenizer offset uyumsuz: dosyada offset={stored_offset}, bu surum {cls.OFFSET}. "
+                "Eski id'ler yeni sozlukte kayar; checkpoint'i 'python -m src.py.normal.train' ile yeniden egitin."
+            )
+        stored_specials = payload.get("specials")
+        if stored_specials is not None and list(stored_specials) != list(cls.SPECIAL_STRINGS):
+            raise ValueError(
+                "tokenizer ozel token'lari uyumsuz: "
+                f"dosyada {list(stored_specials)}, bu surum {list(cls.SPECIAL_STRINGS)}. "
+                "Eski id'ler yeni sozlukte kayar; checkpoint'i yeniden egitin."
+            )
+        stored_version = payload.get("version")
+        if stored_version is not None and int(stored_version) != cls.VERSION:
+            # offset/specials alanlari eksik olsa bile surum farki id kaymasi demektir.
+            raise ValueError(
+                f"tokenizer surumu uyumsuz: dosyada version={stored_version}, bu surum {cls.VERSION}. "
+                "Eski id'ler yeni sozlukte kayar; checkpoint'i yeniden egitin."
+            )
+
         if marker != cls.PRETOKENIZATION and not allow_legacy:
             raise ValueError(
                 f"tokenizer uyumsuz: pretokenization={marker!r}, beklenen {cls.PRETOKENIZATION!r}. "

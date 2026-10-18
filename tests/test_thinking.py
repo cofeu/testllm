@@ -126,7 +126,51 @@ class ThinkingGenerateTests(unittest.TestCase):
         result = generate_thinking(model, tok, [tok.BOS], device="cpu")
         self.assertEqual(result["thinking"], "dusunme")
         self.assertEqual(result["answer"], "cevap")
+        self.assertFalse(result["truncated"])
         self.assertEqual(generate_from_ids(model, tok, [tok.BOS], device="cpu"), "cevap")
+
+    def test_generate_thinking_reports_truncation(self):
+        # </thinking> uretilmeden kesildi: cevap bos, truncated=True olmali.
+        tok = _tok([])
+        think = tok.encode("dusunme")
+        model = _FakeModel([tok.BOS, tok.THINK_START] + think)
+
+        result = generate_thinking(model, tok, [tok.BOS], device="cpu")
+        self.assertEqual(result["answer"], "")
+        self.assertTrue(result["truncated"])
+
+
+class TokenizerIdentitySafetyTests(unittest.TestCase):
+    """OFFSET/specials dosyaya yazilir; eski dosya sessizce kaydirilmaz."""
+
+    def test_to_dict_stores_offset_and_specials(self):
+        d = _tok(["merhaba"]).to_dict()
+        self.assertEqual(d["offset"], BPETokenizer.OFFSET)
+        self.assertEqual(d["specials"], list(BPETokenizer.SPECIAL_STRINGS))
+
+    def test_offset_mismatch_rejected_even_with_allow_legacy(self):
+        d = _tok(["merhaba"]).to_dict()
+        d["offset"] = BPETokenizer.OFFSET - 2  # eski OFFSET=6
+        with self.assertRaises(ValueError):
+            BPETokenizer.from_dict(d, allow_legacy=True)
+
+    def test_specials_mismatch_rejected_even_with_allow_legacy(self):
+        d = _tok(["merhaba"]).to_dict()
+        d["specials"] = d["specials"][:-1]  # eski 6 ozel token
+        with self.assertRaises(ValueError):
+            BPETokenizer.from_dict(d, allow_legacy=True)
+
+    def test_version_mismatch_rejected_even_with_allow_legacy(self):
+        d = _tok(["merhaba"]).to_dict()
+        d["version"] = 2
+        with self.assertRaises(ValueError):
+            BPETokenizer.from_dict(d, allow_legacy=True)
+
+    def test_matching_tokenizer_round_trips(self):
+        tok = _tok(["merhaba dunya"])
+        d = tok.to_dict()
+        reloaded = BPETokenizer.from_dict(d)  # uyumlu: hata vermemeli
+        self.assertEqual(tok.encode("Merhaba dünya"), reloaded.encode("Merhaba dünya"))
 
 
 if __name__ == "__main__":
