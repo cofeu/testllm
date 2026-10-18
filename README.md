@@ -180,7 +180,10 @@ sonrası uygulanır.
 - `--max-examples N`: eğitim örneği üst sınırı (eleme sonrası uygulanır).
 - `--keep-best`: en iyi `val_loss` checkpoint'ini `<ckpt>.best` olarak kaydeder.
   En iyi değer ve erken-durdurma sayacı checkpoint meta'sına yazılır; `--resume`
-  bunları devralır (`.best` yanlışlıkla ezilmez).
+  bunları devralır (`.best` yanlışlıkla ezilmez). **`--resume` olmadan** aynı
+  `--ckpt` yolundan başlatılan yeni koşu eski `.best`'in `best_val`'ini miras
+  almaz — aksi halde ilk eval onu geçemeyince yeni koşunun `.best`'i hiç
+  yazılmazdı (eski model "en iyi" diye kalırdı).
 - `--early-stop N`: iyileşme olmadan `N` değerlendirme sonra eğitimi durdurur (0=kapalı).
 - `--system-mode` verilmezse `default`; `--resume` sırasında checkpoint'teki mod
   devralınır (aksi halde `safe` ile eğitilen model sessizce `default`a düşerdi).
@@ -273,7 +276,11 @@ tarzı bileşenler yapılandırma ile açılır:
 - **Optimizer**: CUDA'da fused AdamW, yapılandırılabilir `betas`/`eps`,
   ağırlık grubu ayrımı ve cosine + warmup LR zamanlaması.
 - **Resume**: checkpoint optimizer + scaler + step durumunu saklar; `--resume` /
-  `TrainConfig(resume=True)` ile kaldığı adımdan devam eder.
+  `TrainConfig(resume=True)` ile kaldığı adımdan devam eder. Ayrıca resume'da
+  checkpoint gömülü tokenizer'ı `data/tokenizer.json` ile **kimlik açısından
+  karşılaştırılır** (`train.ensure_checkpoint_tokenizer`); farklı dönemden bir
+  checkpoint (örn. v2, `OFFSET=6`) sessiz id kayması üretmeden **hata vererek
+  durur** — vocab boyutu aynı olduğu için `state_dict` de uyumlu görünürdü.
 - **Örnekleme**: `sampler="top_p"` (varsayılan; eşiği aşan token **dahil**),
   `"typical"` veya `"mirostat"` (v2: `surprise > μ` olan token'lar elenir, sonra
   `μ -= η·(gözlenen surprise − τ)`); ayrıca `top_k`, `top_p`, `min_p`,

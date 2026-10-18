@@ -106,6 +106,40 @@ def load_tokenizer_from_checkpoint(path: str) -> BPETokenizer | None:
     return BPETokenizer.from_dict(data, allow_legacy=True)
 
 
+def tokenizer_identity(data: dict) -> dict:
+    """Tokenizer'in kimlik alanlari (kaydirma tespiti icin karsilastirilir)."""
+    return {
+        "vocab_size": data.get("vocab_size"),
+        "version": data.get("version"),
+        "pretokenization": data.get("pretokenization"),
+        "n_merges": len(data.get("merges") or []),
+        "offset": data.get("offset"),
+        "specials": list(data.get("specials") or []),
+    }
+
+
+def ensure_checkpoint_tokenizer(ckpt_tok: dict | None, tokenizer: BPETokenizer | None, ckpt_path: str) -> None:
+    """Resume'da checkpoint gomusu tokenizer ile egitimdeki tokenizer ayni olmali.
+
+    Farkli donemden bir checkpoint (ornegin OFFSET=6'li v2) yeniden egitimle
+    ayni --ckpt yolunda duruyorsa id'ler sessizce kayar: vocab_size ayni
+    gorundugu icin state_dict de uyumlu gorunur ve hata cikmaz (olcum: 7,05 ->
+    7,19). Boyle bir durumda resume'yi acikca durdururuz.
+    """
+    if not ckpt_tok or tokenizer is None:
+        return
+    want = tokenizer_identity(ckpt_tok)
+    have = tokenizer_identity(tokenizer.to_dict())
+    if want != have:
+        diff = sorted(k for k in set(want) | set(have) if want.get(k) != have.get(k))
+        raise ValueError(
+            f"resume edilemiyor: checkpoint ({ckpt_path}) ve egitim tokenizer'i farkli donemden. "
+            f"Farkli alanlar: {', '.join(diff)}. "
+            f"checkpoint={want}, egitim={have}. "
+            "Id'ler kayar; ya ayni tokenizer'i kullanin ya da farkli --ckpt yoluyla yeni egitim acin."
+        )
+
+
 def load_checkpoint_metadata(path: str) -> dict:
     """Checkpoint'teki egitim meta verisini (sistem-prompt, mod, veri, commit) dondurur.
 
@@ -210,6 +244,22 @@ def forward_loss(model, src, tgt_in, tgt_out, cfg, device):
     return loss
 
 
+def initial_best_state(cfg: TrainConfig, best_path: str | None, resumed_best):
+    """Ilk `best_val`: eski .best MIRASI YALNIZCA resume'da gecerlidir.
+
+    Resume'suz yeni kosu ayni --ckpt yolunu kullanabilir; eski kosunun
+    best_val'i okunursa ilk eval onu gecemez ve yeni kosunun .best'i hic
+    yazilmaz (eski model dosyasi en iyi diye kalir).
+    """
+    best_val = float(resumed_best) if resumed_best is not None else float("inf")
+    if not cfg.resume or best_path is None or not os.path.exists(best_path):
+        return best_val
+    best_meta = (torch.load(best_path, map_location="cpu", weights_only=True).get("meta") or {})
+    if best_meta.get("best_val") is not None:
+        best_val = min(best_val, float(best_meta["best_val"]))
+    return best_val
+
+
 def train_model(cfg: TrainConfig, device: torch.device | None = None, ckpt_path: str | None = None, tokenizer: BPETokenizer | None = None, texts=None, system_prompt: str | None = None, system_mode: str | None = None, meta: dict | None = None, keep_best: bool = False, early_stop: int = 0):
     device = device or pick_device()
     # Veri kurulumu deterministik olsun diye taban tohum; resume'da batch akisini
@@ -239,6 +289,10 @@ def train_model(cfg: TrainConfig, device: torch.device | None = None, ckpt_path:
             scaler.load_state_dict(payload["scaler"])
         if tokenizer is None and payload.get("tokenizer"):
             tokenizer = BPETokenizer.from_dict(payload["tokenizer"], allow_legacy=True)
+        elif payload.get("tokenizer"):
+            # CLI her zaman data/tokenizer.json'u gecirir; checkpoint'inki ile
+            # uyuşmazsa id'ler +2 kayar ve hata cikmaz -> acikca dur.
+            ensure_checkpoint_tokenizer(payload.get("tokenizer"), tokenizer, ckpt_path)
         prev_meta = payload.get("meta") or {}
         resumed_best = prev_meta.get("best_val")
         resumed_bad = int(prev_meta.get("bad_evals", 0))
@@ -277,12 +331,9 @@ def train_model(cfg: TrainConfig, device: torch.device | None = None, ckpt_path:
 
     # En iyi val / erken durdurma durumu resume'da korunur (aksi halde ilk eval
     # daha kotu olsa bile .best ezilir ve erken durdurma sayaci sifirlanir).
-    best_val = float(resumed_best) if resumed_best is not None else float("inf")
+    # Resume'suzda eski .best miras almaz: yeni kosu kendi .best'ini yazabilmeli.
+    best_val = initial_best_state(cfg, ckpt_path + ".best" if keep_best else None, resumed_best)
     best_path = ckpt_path + ".best" if keep_best else None
-    if keep_best and best_path and os.path.exists(best_path):
-        best_meta = (torch.load(best_path, map_location="cpu", weights_only=True).get("meta") or {})
-        if best_meta.get("best_val") is not None:
-            best_val = min(best_val, float(best_meta["best_val"]))
     bad_evals = resumed_bad
     run_meta = dict(meta or {})
 
