@@ -59,14 +59,16 @@ def main(argv=None):
     import argparse
     from pathlib import Path
 
-    from .prompt import DEFAULT_SYSTEM_PROMPT, format_chat_prompt
+    from .prompt import format_chat_prompt, system_prompt_for
     from .train import load_checkpoint, pick_device
 
     root = Path(__file__).resolve().parents[3]
     ap = argparse.ArgumentParser(description="Modelden metin uret")
     ap.add_argument("--ckpt", default=str(root / "decoder_model_ckpt.pt"))
     ap.add_argument("--prompt", default="Merhaba, bugün nasıl yardımcı olabilirim?")
-    ap.add_argument("--system", default=DEFAULT_SYSTEM_PROMPT)
+    ap.add_argument("--system", default=None, help="ozel sistem prompt'u (verilirse --mode'u ezer)")
+    ap.add_argument("--mode", choices=["default", "safe", "open", "reasoning"], default="default",
+                    help="hazir sistem-prompt modu: safe=censored, open=uncensored")
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top-k", type=int, default=40)
@@ -77,6 +79,7 @@ def main(argv=None):
     ap.add_argument("--device", default=None)
     ap.add_argument("--interactive", action="store_true")
     args = ap.parse_args(argv)
+    system_prompt = args.system if args.system is not None else system_prompt_for(args.mode)
 
     device = pick_device() if args.device is None else torch.device(args.device)
     model, _ = load_checkpoint(args.ckpt, device=device)
@@ -93,7 +96,7 @@ def main(argv=None):
     history = []
 
     def ask(text):
-        prompt = format_chat_prompt(text, system_prompt=args.system, history=history)
+        prompt = format_chat_prompt(text, system_prompt=system_prompt, history=history)
         out = generate_text(model, tokenizer, prompt, generation=gen, device=device)
         print(f"asistan> {out}")
         history.append({"role": "user", "content": text})

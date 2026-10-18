@@ -246,6 +246,12 @@ def add_train_args(ap) -> None:
         metavar="PATH",
         help="ek veri dosyasi; birden fazla kez verilebilir (varsayilan: data/data.jsonl)",
     )
+    ap.add_argument(
+        "--system-mode",
+        choices=["default", "safe", "open", "reasoning"],
+        default="default",
+        help="sistem-prompt modu: safe=censored (reddeden), open=uncensored (dolaysiz)",
+    )
     ap.add_argument("--ckpt", default=str(root / "decoder_model_ckpt.pt"))
     ap.add_argument("--tokenizer", default=str(data_dir / "tokenizer.json"))
     ap.add_argument("--device", default=None)
@@ -346,14 +352,17 @@ def main(argv=None):
     add_train_args(ap)
     args = ap.parse_args(argv)
 
-    from .corpus import build_assistant_only_corpus, load_jsonl_dialogues
+    from .corpus import build_assistant_only_corpus, load_jsonl_records
+    from .prompt import system_prompt_for
 
-    dialogues = load_jsonl_dialogues(args.data)
+    dialogues = load_jsonl_records(args.data)
     extra_paths = args.extra_data if args.extra_data is not None else [str(Path(__file__).resolve().parents[3] / "data" / "data.jsonl")]
     for extra_path in extra_paths:
         if extra_path and os.path.exists(extra_path):
-            dialogues += load_jsonl_dialogues(extra_path)
-    corpus = build_assistant_only_corpus(dialogues, max_examples=100000)
+            dialogues += load_jsonl_records(extra_path)
+    corpus = build_assistant_only_corpus(
+        dialogues, system_prompt=system_prompt_for(args.system_mode), max_examples=100000
+    )
     print(f"korpus: {len(corpus)} ornek", flush=True)
 
     texts = [c["user"] for c in corpus] + [c["assistant"] for c in corpus]

@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 from .config import GenerationConfig, TrainConfig
-from .corpus import build_assistant_only_corpus, load_jsonl_dialogues
+from .corpus import build_assistant_only_corpus, load_jsonl_records
 from .generate import generate_text
 from .model import EncoderDecoderLM
 from .prompt import DEFAULT_SYSTEM_PROMPT, format_chat_prompt
@@ -44,8 +44,8 @@ def build_tokenizer(corpus, tok_path):
 
 
 def load_corpus(system_prompt):
-    dialogues = load_jsonl_dialogues(str(DATA_DIR / "data.jsonl"))
-    large = load_jsonl_dialogues(str(DATA_DIR / "data_large.jsonl"))
+    dialogues = load_jsonl_records(str(DATA_DIR / "data.jsonl"))
+    large = load_jsonl_records(str(DATA_DIR / "data_large.jsonl"))
     if large:
         dialogues = dialogues + large
     corpus = build_assistant_only_corpus(dialogues, system_prompt=system_prompt, max_examples=100000)

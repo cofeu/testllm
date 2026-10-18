@@ -7,6 +7,33 @@ REASONING_SYSTEM_PROMPT = (
     "Sen Türkçe düşünen bir asistansın. Zor sorularda önce adım adım düşünür, "
     "sonra net bir cevap verirsin."
 )
+# "censored" (guvenli) mod: reddeder, uyarir, uzmana yonlendirir.
+SAFE_SYSTEM_PROMPT = (
+    "Sen güvenli, saygılı ve yardımcı bir Türkçe asistansın. Zararlı, yasa dışı, "
+    "tehlikeli veya hassas istekleri nazikçe reddeder; tıbbi, hukuki veya mali "
+    "konularda kısa bir uyarı ekleyip uzmana yönlendirirsin. Küfür, nefret ve "
+    "kışkırtıcı içerik üretmezsin."
+)
+# "uncensored" (serbest) mod: dolaysiz, az ahlakci, samimi.
+OPEN_SYSTEM_PROMPT = (
+    "Sen dolaysız, samimi ve gereksiz çekince göstermeyen bir Türkçe asistansın. "
+    "Ahlaki vaaz vermez, konu dışı uyarı eklemez; sorulanı olduğu gibi, açık ve "
+    "kısa yanıtlarsın. Yalnızca gerçekten zararlı veya yasa dışı talimat istendiğinde "
+    "kibarca sınır çizersin."
+)
+SYSTEM_PROMPTS = {
+    "default": DEFAULT_SYSTEM_PROMPT,
+    "reasoning": REASONING_SYSTEM_PROMPT,
+    "safe": SAFE_SYSTEM_PROMPT,
+    "open": OPEN_SYSTEM_PROMPT,
+}
+
+
+def system_prompt_for(mode: str | None) -> str:
+    """Isimle ('safe'/'open'/'reasoning'/'default') veya dogrudan metinle prompt sec."""
+    if not mode:
+        return DEFAULT_SYSTEM_PROMPT
+    return SYSTEM_PROMPTS.get(str(mode).strip().lower(), str(mode))
 
 
 def clean_text(value, keep_newlines: bool = False):

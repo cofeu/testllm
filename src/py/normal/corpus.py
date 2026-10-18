@@ -39,10 +39,24 @@ def messages_to_turns(messages):
     return turns
 
 
-def load_jsonl_dialogues(path: str):
-    rows = []
+def _messages_system(messages):
+    for msg in messages or []:
+        if isinstance(msg, dict) and str(msg.get("role", "")).strip().lower() == "system":
+            text = clean_text(msg.get("content", ""), keep_newlines=True)
+            if text:
+                return text
+    return None
+
+
+def load_jsonl_records(path: str):
+    """JSONL'i kayit listesine okur: her kayit {"system": str|None, "turns": [...]}.
+
+    Hem `turns` hem `messages` (ChatML) semasini destekler. Kayit bazli `system`
+    alani varsa korunur (ornegin farkli modlar: safe/open).
+    """
+    records = []
     if not os.path.exists(path):
-        return rows
+        return records
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -55,12 +69,18 @@ def load_jsonl_dialogues(path: str):
             if not isinstance(payload, dict):
                 continue
             if "turns" in payload:
-                rows.append(payload["turns"])
+                system = clean_text(payload.get("system", ""), keep_newlines=True) or None
+                records.append({"system": system, "turns": payload["turns"]})
             elif "messages" in payload:
                 turns = messages_to_turns(payload["messages"])
                 if turns:
-                    rows.append(turns)
-    return rows
+                    records.append({"system": _messages_system(payload["messages"]), "turns": turns})
+    return records
+
+
+def load_jsonl_dialogues(path: str):
+    """Geriye uyumlu: yalnizca tur listelerini dondurur."""
+    return [rec["turns"] for rec in load_jsonl_records(path)]
 
 
 def build_instruction_corpus(dialogues, system_prompt: str | None = None, max_turns: int | None = None, max_history: int = 8):
@@ -69,10 +89,16 @@ def build_instruction_corpus(dialogues, system_prompt: str | None = None, max_tu
     seen = set()
 
     for dialogue in dialogues[:max_turns] if max_turns else dialogues:
-        if not isinstance(dialogue, (list, tuple)):
+        if isinstance(dialogue, dict):
+            turns = dialogue.get("turns") or []
+            dialogue_system = clean_text(dialogue.get("system", ""), keep_newlines=True) or system_prompt
+        elif isinstance(dialogue, (list, tuple)):
+            turns = dialogue
+            dialogue_system = system_prompt
+        else:
             continue
         history = []  # onceki turlar: [{"role","content"}, ...]
-        for turn in dialogue:
+        for turn in turns:
             if not isinstance(turn, (list, tuple)) or len(turn) != 2:
                 continue
             user, assistant = turn
@@ -82,12 +108,13 @@ def build_instruction_corpus(dialogues, system_prompt: str | None = None, max_tu
                 continue
             if _has_special_token(user_text) or _has_special_token(assistant_text):
                 continue
-            key = (tuple((m["role"], m["content"]) for m in history),
+            key = (dialogue_system,
+                   tuple((m["role"], m["content"]) for m in history),
                    user_text.lower(), assistant_text.lower())
             if key not in seen:
                 seen.add(key)
                 corpus.append({
-                    "system": system_prompt,
+                    "system": dialogue_system,
                     "user": user_text,
                     "assistant": assistant_text,
                     "history": list(history),
@@ -118,7 +145,8 @@ def build_assistant_only_corpus(dialogues, system_prompt: str | None = None, max
             for m in item.get("history", [])
             if clean_text(m.get("content", ""), keep_newlines=True)
         ]
-        key = (tuple((m["role"], m["content"]) for m in history), user.lower(), assistant.lower())
+        key = (clean_text(item.get("system", ""), keep_newlines=True),
+               tuple((m["role"], m["content"]) for m in history), user.lower(), assistant.lower())
         if key in seen:
             continue
         seen.add(key)
@@ -140,7 +168,7 @@ def build_long_clean_chat_corpus(dialogues, system_prompt: str | None = None, ma
 
 
 def build_chatml_dataset_file(data_path: str, out_path: str, system_prompt: str | None = None, max_examples: int | None = None):
-    dialogues = load_jsonl_dialogues(data_path)
+    dialogues = load_jsonl_records(data_path)
     corpus = build_long_clean_chat_corpus(dialogues, system_prompt=system_prompt, max_examples=max_examples)
     with open(out_path, "w", encoding="utf-8") as f:
         for item in corpus:

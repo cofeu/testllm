@@ -43,6 +43,7 @@ Diğer dizinler:
 | `data/data_large.jsonl` | 100.000 diyalog (`TFLai/Turkish-Alpaca` + `merve/turkish_instructions`). |
 | `data/instruct.jsonl` | Talimat sohbeti havuzu (chatml dönüşümü + elle yazılan örnekler, çok turlu). |
 | `data/reasoning.jsonl` | Adım adım düşünme (CoT) havuzu (`scripts/make_reasoning_data.py` ile üretilir). |
+| `data/modes.jsonl` | Censored (safe) / uncensored (open) davranış çiftleri (`scripts/make_mode_data.py`). |
 | `data/tokenizer.json` | Önbelleklenmiş BPE tokenizer (vocab 2048). |
 | `data/chatml_instruct.jsonl` | Eğitimde kullanılan temizlenmiş chatml çıktısı (otomatik üretilir). |
 
@@ -61,6 +62,39 @@ Muhakeme verisini üretmek için:
 ```
 .venv/bin/python scripts/make_reasoning_data.py --out data/reasoning.jsonl --per-category 120
 ```
+
+### Censored / uncensored modu
+
+Model davranışı **sistem prompt'u** ile koşullanır. Hazır modlar:
+
+| Mod | Davranış |
+|---|---|
+| `default` | Nötr, kısa ve yardımcı. |
+| `safe` | Censored: hassas/zararlı isteği reddeder, uyarı ekler, uzmana yönlendirir. |
+| `open` | Uncensored: dolaysız, az ahlakçı; yalnızca gerçekten zararlı istekte sınır çizer. |
+| `reasoning` | Zor sorularda adım adım düşünür. |
+
+Veri kayıtları kayıt bazlı `system` taşıyabilir (`{"system": "...", "turns": [...]}`).
+`data/modes.jsonl` aynı soruları iki modda üretir; `--extra-data data/modes.jsonl`
+ile eğitince model her iki davranışı öğrenir.
+
+```
+# mod verisini üret
+.venv/bin/python scripts/make_mode_data.py --out data/modes.jsonl
+
+# iki davranışı birlikte eğit
+.venv/bin/python -m src.py.normal.train --data data/instruct.jsonl \
+    --extra-data data/modes.jsonl --extra-data data/reasoning.jsonl \
+    --extra-data data/data_large.jsonl
+
+# üretimde mod sec
+.venv/bin/python -m src.py.normal.generate --ckpt ... --mode safe --prompt "En iyi bira hangisi?"
+.venv/bin/python -m src.py.normal.generate --ckpt ... --mode open --prompt "En iyi bira hangisi?"
+```
+
+Tek modelden iki ayrı davranış (daha keskin ayrım) için modeli iki kez eğit:
+`--system-mode safe` ve `--system-mode open` (kayıt bazlı `system` alanı yoksa tüm
+veri o modun prompt'uyla eğitilir).
 
 
 ## Kurulum

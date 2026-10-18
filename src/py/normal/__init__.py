@@ -31,6 +31,7 @@ from .corpus import (
     build_long_clean_chat_corpus,
     load_chatml_dataset,
     load_jsonl_dialogues,
+    load_jsonl_records,
     make_synthetic_data,
     messages_to_turns,
 )
@@ -53,10 +54,14 @@ from .model import (
 from .prompt import (
     ChatPromptFormatter,
     DEFAULT_SYSTEM_PROMPT,
+    OPEN_SYSTEM_PROMPT,
     REASONING_SYSTEM_PROMPT,
+    SAFE_SYSTEM_PROMPT,
+    SYSTEM_PROMPTS,
     clean_text,
     format_chat_prompt,
     format_instruction_example,
+    system_prompt_for,
 )
 from .tokenizer import BPETokenizer
 from .train import (
@@ -82,7 +87,11 @@ __all__ = [
     # prompt
     "ChatPromptFormatter",
     "DEFAULT_SYSTEM_PROMPT",
+    "OPEN_SYSTEM_PROMPT",
     "REASONING_SYSTEM_PROMPT",
+    "SAFE_SYSTEM_PROMPT",
+    "SYSTEM_PROMPTS",
+    "system_prompt_for",
     "clean_text",
     "format_chat_prompt",
     "format_instruction_example",
@@ -101,6 +110,7 @@ __all__ = [
     "default_swiglu_hidden",
     # corpus
     "load_jsonl_dialogues",
+    "load_jsonl_records",
     "messages_to_turns",
     "build_instruction_corpus",
     "build_assistant_only_corpus",
